@@ -152,6 +152,16 @@ impl HostHeap {
             }
         } else if let Ok(heap) = make((count + DYNAMIC).max(views)) {
             (heap, count, DYNAMIC)
+        } else if count + DYNAMIC <= PORTABLE_VIEWS
+            && let Ok(heap) = make(PORTABLE_VIEWS)
+        {
+            // A host that caps its heaps below `HEAP_VIEWS` (NVIDIA:
+            // 1,000,000 views) still takes the portable limit: the full
+            // dynamic range, and the rest for host copies' view pairs, which
+            // otherwise take dynamic slots (2^16 of them ran out in the
+            // world, #59). Indices past the heap fault, as below.
+            tracing::info!(count, "host view heap capped at {PORTABLE_VIEWS}");
+            (heap, count, DYNAMIC)
         } else {
             // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
             // faults on an index past them, as before the clamp.
@@ -384,6 +394,13 @@ impl HostHeap {
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    /// The dynamic slots past [`HostHeap::count`]: where host copies' view
+    /// pairs start when the heap has room for them.
+    #[cfg(test)]
+    pub(crate) fn dynamic_slots(&self) -> u32 {
+        self.dynamic
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
@@ -2223,7 +2240,14 @@ mod tests {
         // `HEAP_VIEWS`, `HEAP_SAMPLERS`).
         // SAFETY: plain queries of live heaps.
         unsafe {
-            assert!(heap.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_VIEWS);
+            let total = heap.heap.GetDesc().NumDescriptors;
+            if total < victory_shader::emit::HEAP_VIEWS {
+                // A capped host (NVIDIA): indices past the heap fault, but
+                // every title and dynamic slot is there.
+                eprintln!("host view heap capped at {total} slots, below HEAP_VIEWS");
+                assert!(total >= heap.count + heap.dynamic);
+                assert!(heap.dynamic >= MIN_DYNAMIC);
+            }
             let samplers = HostHeap::new(true, 128).unwrap();
             assert!(samplers.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_SAMPLERS);
         }
