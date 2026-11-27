@@ -370,6 +370,24 @@ fn listed_pair_hash(hash: &str, list: &[String]) -> bool {
 
 #[cfg(test)]
 #[test]
+fn a_ray_testing_program_is_translated_from_its_container() {
+    // The input holds the build key and the ray-test key before the
+    // container; the converter is handed the container alone.
+    let seen = std::sync::Mutex::new(Vec::new());
+    let converter = Translate {
+        translate: |c: &[u8]| {
+            seen.lock().unwrap().extend_from_slice(c);
+            Err("stop".to_owned())
+        },
+        ran: AtomicBool::new(false),
+        container_at: 32 + b"bvh no hit".len(),
+    };
+    let input = [&[7u8; 32][..], b"bvh no hit", b"DXBC..."].concat();
+    assert!(converter.convert(&input).is_err());
+    assert_eq!(&seen.lock().unwrap()[..], b"DXBC...");
+}
+
+#[test]
 fn the_builder_switches_leave_the_build_key_alone() {
     let unset = b"HASH\x00\x01VICTORY_BVH_BUILDER=\0VICTORY_BVH_NO_HIT=\0VICTORY_GROUP_SYNC=2\0tail".to_vec();
     let set = b"HASH\x00\x01VICTORY_BVH_BUILDER=0\0VICTORY_BVH_NO_HIT=1\0VICTORY_GROUP_SYNC=2\0tail".to_vec();
@@ -487,6 +505,11 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
 struct Translate<F> {
     translate: F,
     ran: AtomicBool,
+    /// Where the container starts in the input: after the build key and
+    /// the ray-test key ([`cached`]). Run 13 translated from the build
+    /// key's end, so the 64 programs that test rays were handed their key
+    /// with the container ("not a DXBC container") and none translated.
+    container_at: usize,
 }
 
 impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
@@ -499,7 +522,7 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
+        let shader = (self.translate)(&input[self.container_at..]).map_err(anyhow::Error::msg)?;
         Ok(encode(&shader))
     }
 }
@@ -522,6 +545,7 @@ fn cached(
     let converter = Translate {
         translate,
         ran: AtomicBool::new(false),
+        container_at: build.len() + bvh.len(),
     };
     for _ in 0..2 {
         let path = cache
