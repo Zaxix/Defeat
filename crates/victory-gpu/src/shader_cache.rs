@@ -144,7 +144,66 @@ fn fresh(c: &[u8]) -> bool {
         }
         list
     });
-    !list.is_empty() && listed_pair_hash(blake3::hash(c).to_hex().as_str(), list)
+    if list.is_empty() && !pairs_by_default() {
+        return false;
+    }
+    let hash = blake3::hash(c).to_hex();
+    // The default pairs list's shaders: the cache holds their old 64-lane
+    // translation (keyed as before, the list being unset), which the card
+    // refuses; they are translated anew at each launch instead.
+    listed_pair_hash(hash.as_str(), list) || (pairs_by_default() && listed_pair_hash(hash.as_str(), pairs_list()))
+}
+
+/// The compute programs the owner's RTX 4070 refused in runs 5-11, every
+/// one asking for 64-lane waves (the card runs 32): the paired form
+/// (`victory_shader::emit::with_wave_pairs`, pull request #854 with the
+/// gta6 base's exact reductions) is tried for them first by default. It
+/// runs a console wave of 64 lanes as one host wave of 32 lanes, each
+/// lane doing two, so every wave operation sees all 64 lanes: exact, at
+/// twice the work a lane. Where it is refused (its reason is logged as
+/// `WAVE64-PAIRS-ONLY refused`) the usual forms follow, as before. The
+/// base made the water's two programs (the last two) right this way, with
+/// `VICTORY_WAVE_PAIRS_FP32=non-ieee-rne-ftz` for their float reductions.
+const PAIRS_BY_DEFAULT: [&str; 15] = [
+    "2da4beb386509b77",
+    "369cbe906ea72764",
+    "02384a60fda6f2d0",
+    "6b82bc7d22016cb5",
+    "18d957e62926ed3e",
+    "407eca669212d400",
+    "5e3dd99e0f067aee",
+    "ae0deeafe219c15c",
+    "57f1b81de55c2842",
+    "9fe711566bec0d0a",
+    "a40ae27594631121",
+    "2889c21328c69e58",
+    "888af37a584acf98",
+    "5dc3b25986622949",
+    "6f225b641c5b0708",
+];
+
+/// Whether [`PAIRS_BY_DEFAULT`] is the pairs list: `VICTORY_WAVE_PAIRS_ONLY`
+/// unset. (Set, it is the list; `none` is none.)
+fn pairs_by_default() -> bool {
+    std::env::var_os("VICTORY_WAVE_PAIRS_ONLY").is_none()
+}
+
+/// The pairs list in force: `VICTORY_WAVE_PAIRS_ONLY`, or
+/// [`PAIRS_BY_DEFAULT`] when that is unset.
+fn pairs_list() -> &'static [String] {
+    static LIST: OnceLock<Vec<String>> = OnceLock::new();
+    LIST.get_or_init(|| parse_pairs(std::env::var("VICTORY_WAVE_PAIRS_ONLY").ok().as_deref()))
+}
+
+fn parse_pairs(value: Option<&str>) -> Vec<String> {
+    match value {
+        None => PAIRS_BY_DEFAULT.iter().map(|h| (*h).to_owned()).collect(),
+        Some(v) => v
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect(),
+    }
 }
 
 /// A container translated with the wave-wide form allowed when its hash is
@@ -169,22 +228,106 @@ fn translate_listed(c: &[u8]) -> Result<HostShader, String> {
     });
     let hash = blake3::hash(c).to_hex();
     let wide = list.iter().any(|h| hash.starts_with(h.as_str()));
-    static PAIRS: OnceLock<Vec<String>> = OnceLock::new();
-    let pairs = PAIRS.get_or_init(|| {
-        std::env::var("VICTORY_WAVE_PAIRS_ONLY")
-            .unwrap_or_default()
-            .split(',')
-            .map(|h| h.trim().to_ascii_lowercase())
-            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
-            .collect()
-    });
+    let pairs = pairs_list();
     let paired = listed_pair_hash(hash.as_str(), pairs);
     if paired {
         eprintln!("WAVE64-PAIRS-ONLY selected {}", &hash.as_str()[..16]);
     }
-    victory_shader::emit::with_wave_wide(wide, || {
+    let done = victory_shader::emit::with_wave_wide(wide, || {
         victory_shader::emit::with_wave_pairs(paired, || victory_shader::emit::translate(c))
-    }).map_err(|e| e.to_string())
+    })
+    .map_err(|e| e.to_string());
+    if let Err(e) = &done
+        && e.contains("a descriptor read only as data")
+    {
+        descriptor_trace(&hash.as_str()[..16], c);
+    }
+    done
+}
+
+/// For a program that stops at "a descriptor read only as data" (five
+/// compute programs in runs 5-11, all at an `s_load_dwordx4` from root
+/// parameter 228 with an offset known only at run time): which of each
+/// such load's four dwords the code reads, and by what, two steps on.
+/// The translator gives those dwords a meaning only where it can tell what
+/// they are (a buffer's record count is dword 2); the lines say what the
+/// rest of the code wants from them. Once per program and launch, on
+/// standard error as `DESC-TRACE <hash>` lines. Here and not in the
+/// translator: a change to the translator's crate misses every cached
+/// translation.
+fn descriptor_trace(hash: &str, container: &[u8]) {
+    static DONE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    {
+        let mut done = DONE.lock().unwrap_or_else(|e| e.into_inner());
+        if done.iter().any(|h| h == hash) {
+            return;
+        }
+        done.push(hash.to_owned());
+    }
+    let program = (|| {
+        let c = victory_shader::Container::parse(container).ok()?;
+        let dxil = c.part(victory_shader::FourCC::DXIL)?;
+        let native = victory_shader::native_programs(dxil.data).ok()?.into_iter().find(|p| p.stage == HwStage::Cs)?;
+        victory_shader::spill::build(&native).ok()
+    })();
+    let Some(p) = program else {
+        eprintln!("DESC-TRACE {hash} the program could not be decoded again");
+        return;
+    };
+    for line in descriptor_uses(&p) {
+        eprintln!("DESC-TRACE {hash} {line}");
+    }
+}
+
+/// [`descriptor_trace`]'s lines for program `p`: every 4- or 8-dword scalar
+/// load no image or buffer instruction uses as its descriptor, and for each of its dwords the instructions that read it, then
+/// what reads theirs.
+fn descriptor_uses(p: &victory_shader::ir::Program) -> Vec<String> {
+    use victory_shader::ir::{Inst, Reg, Value};
+    let insts: Vec<&Inst> = p.blocks.iter().flat_map(|b| &b.insts).collect();
+    let reg = |r: &Reg| match r {
+        Reg::S(n) => format!("s{n}"),
+        Reg::V(n) => format!("v{n}"),
+        Reg::Scc => "scc".to_owned(),
+    };
+    // Values a phi carries on, as the value it makes.
+    let through = |v: Value| -> Vec<Value> {
+        p.blocks.iter().flat_map(|b| &b.phis).filter(|f| f.args.contains(&v)).map(|f| f.value).collect()
+    };
+    let readers = |v: Value| -> Vec<&Inst> {
+        let mut vs = vec![v];
+        vs.extend(through(v));
+        insts.iter().copied().filter(|i| i.reads.iter().any(|r| vs.contains(&r.1))).collect()
+    };
+    let say = |i: &Inst| {
+        let w: Vec<String> = i.writes.iter().map(|w| reg(&w.0)).collect();
+        let r: Vec<String> = i.reads.iter().map(|r| reg(&r.0)).collect();
+        format!("{:#x} {} [{} <- {}]", i.machine.offset, i.name(), w.join(","), r.join(","))
+    };
+    let mut out = Vec::new();
+    for load in insts.iter().filter(|i| matches!(i.name(), "s_load_dwordx4" | "s_load_dwordx8" | "s_buffer_load_dwordx4" | "s_buffer_load_dwordx8")) {
+        // A load some instruction uses as a descriptor is not the one.
+        let as_descriptor = load.writes.iter().flat_map(|w| readers(w.1)).any(|i| {
+            ["image_", "buffer_", "tbuffer_", "s_buffer_"].iter().any(|k| i.name().starts_with(k))
+        });
+        if as_descriptor {
+            continue;
+        }
+        out.push(format!("load {}", say(load)));
+        for (k, (r, v)) in load.writes.iter().enumerate() {
+            let first = readers(*v);
+            if first.is_empty() {
+                out.push(format!("  dword {k} ({}) read by nothing", reg(r)));
+                continue;
+            }
+            for i in first.iter().take(8) {
+                let next: Vec<String> =
+                    i.writes.iter().flat_map(|w| readers(w.1)).take(4).map(|j| format!("{:#x} {}", j.machine.offset, j.name())).collect();
+                out.push(format!("  dword {k} ({}) -> {} -> [{}]", reg(r), say(i), next.join("; ")));
+            }
+        }
+    }
+    out
 }
 
 fn listed_pair_hash(hash: &str, list: &[String]) -> bool {
@@ -201,6 +344,18 @@ fn diagnostic_switches_leave_the_fingerprint_as_unset() {
     // Other switches still count.
     let other = b"HASH\x00\x01VICTORY_DESC_WHY=\0VICTORY_GROUP_SYNC=0\0VICTORY_WAVE_WHY=\0tail".to_vec();
     assert_ne!(without_diagnostics(other), unset);
+}
+
+#[cfg(test)]
+#[test]
+fn the_pairs_list_is_the_refused_programs_unless_set() {
+    let default = parse_pairs(None);
+    assert_eq!(default.len(), 15);
+    assert!(listed_pair_hash("369cbe906ea72764ffff", &default));
+    assert!(listed_pair_hash("6f225b641c5b0708", &default));
+    assert!(parse_pairs(Some("none")).is_empty());
+    assert!(parse_pairs(Some("")).is_empty());
+    assert_eq!(parse_pairs(Some("5DC3B25986622949, bad")), vec!["5dc3b25986622949".to_owned()]);
 }
 
 #[cfg(test)]
@@ -269,7 +424,7 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
         static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
         let short = &hash.as_str()[..16];
-        eprintln!("SHADER-FRESH {short} translating anew (VICTORY_SHADER_FRESH)");
+        eprintln!("SHADER-FRESH {short} translating anew (VICTORY_SHADER_FRESH, or the default pairs list)");
         let made = translate(container);
         match &made {
             Ok(_) => eprintln!("SHADER-FRESH {short} done: translated"),

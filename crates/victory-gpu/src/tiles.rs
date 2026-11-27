@@ -101,13 +101,16 @@ fn small_when_full_mb() -> u64 {
 const SMALL_TILES: u32 = 16;
 
 /// Whether textures are made this way: the switch
-/// (`VICTORY_LEVELS_ON_DEMAND=1`; off by default), and a card that reads
+/// (`VICTORY_LEVELS_ON_DEMAND`, in the faster defaults since run 11 on the
+/// owner's RTX 4070: 3.0 GB of the card not allocated for levels the title
+/// does not hold, textures turned down for room 73,500 -> 58 times, no
+/// texture without a level; `=0` off), and a card that reads
 /// zeros from, and drops writes to, levels without memory (tiled resources
 /// tier 2).
 pub(crate) fn wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if !std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1") {
+        if !crate::fast::on("VICTORY_LEVELS_ON_DEMAND") {
             return false;
         }
         let Some(host) = host() else {

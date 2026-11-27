@@ -23,6 +23,10 @@
 //! - `VICTORY_WIDE_MERGE`: what shaders wrote to copies in the card's
 //!   memory merged on several threads (now also on the copy-back thread,
 //!   where run 9 spent about 270 ms a frame);
+//! - `VICTORY_LEVELS_ON_DEMAND`: a texture takes the card's memory only for
+//!   the levels the title holds (run 11 on the owner's PC, alone against
+//!   run 10: 3.0 GB of the card kept free, textures turned down for room
+//!   73,500 -> 58 times, frames of over 300 draws 225 -> 195 ms);
 //! - `VICTORY_RECHECK_SOON`: a texture picked by index found changed is
 //!   looked at again the next frame, not four frames later (on by default
 //!   in the AMD sibling repository).
@@ -33,7 +37,7 @@
 use std::sync::OnceLock;
 
 /// The switches [`on`] gives a default to, for the start-up line.
-const SWITCHES: [&str; 8] = [
+const SWITCHES: [&str; 9] = [
     "VICTORY_ASYNC_SUBMIT",
     "VICTORY_QUEUE2",
     "VICTORY_COPY_PLAIN",
@@ -42,6 +46,7 @@ const SWITCHES: [&str; 8] = [
     "VICTORY_CARD_REHASH_RUNS",
     "VICTORY_WIDE_MERGE",
     "VICTORY_RECHECK_SOON",
+    "VICTORY_LEVELS_ON_DEMAND",
 ];
 
 /// Whether the faster defaults hold (`VICTORY_FAST`, unset or anything but
