@@ -295,7 +295,7 @@ impl Shader {
 /// Whether a console container's code tests rays against the nodes of a
 /// ray-tracing structure.
 #[cfg(windows)]
-fn container_walks(container: &[u8]) -> bool {
+pub(crate) fn container_walks(container: &[u8]) -> bool {
     use victory_shader::{Container, FourCC};
     let Ok(c) = Container::parse(container) else {
         return false;

@@ -81,7 +81,7 @@ fn build() -> [u8; 32] {
     if let Some(exe) = exe {
         h.update(exe);
     }
-    h.update(&without_diagnostics(victory_shader::emit::translation_fingerprint()));
+    h.update(&without_bvh(&without_diagnostics(victory_shader::emit::translation_fingerprint())));
     // The list this file reads for the translator (`translate_listed`): the
     // shader crate's fingerprint does not see it.
     h.update(b"VICTORY_WAVE_WIDE_ONLY=");
@@ -103,6 +103,24 @@ fn build() -> [u8; 32] {
     // changes.
     h.update(include_bytes!("shader_cache.key"));
     *h.finalize().as_bytes()
+}
+
+/// `fingerprint` without the values of `VICTORY_BVH_BUILDER` and
+/// `VICTORY_BVH_NO_HIT`: they change only the programs that test rays
+/// against ray-tracing structures, which [`cached`] keys on their effect
+/// (`victory_shader::emit::bvh_no_hit`). With them in the build key a run
+/// with the structure builder on translated all of the title's thousands
+/// of programs again, for the hundred or so that test rays.
+fn without_bvh(fingerprint: &[u8]) -> Vec<u8> {
+    let mut out = fingerprint.to_vec();
+    for name in [&b"VICTORY_BVH_BUILDER="[..], &b"VICTORY_BVH_NO_HIT="[..]] {
+        if let Some(at) = out.windows(name.len()).position(|w| w == name) {
+            let after = at + name.len();
+            let end = out[after..].iter().position(|&b| b == 0).map_or(out.len(), |n| after + n);
+            out.drain(after..end);
+        }
+    }
+    out
 }
 
 /// `fingerprint` without the values of the translator's diagnostic switches
@@ -352,6 +370,16 @@ fn listed_pair_hash(hash: &str, list: &[String]) -> bool {
 
 #[cfg(test)]
 #[test]
+fn the_builder_switches_leave_the_build_key_alone() {
+    let unset = b"HASH\x00\x01VICTORY_BVH_BUILDER=\0VICTORY_BVH_NO_HIT=\0VICTORY_GROUP_SYNC=2\0tail".to_vec();
+    let set = b"HASH\x00\x01VICTORY_BVH_BUILDER=0\0VICTORY_BVH_NO_HIT=1\0VICTORY_GROUP_SYNC=2\0tail".to_vec();
+    assert_eq!(without_bvh(&set), unset);
+    assert_eq!(without_bvh(&unset), unset);
+    let other = b"HASH\x00\x01VICTORY_BVH_BUILDER=0\0VICTORY_BVH_NO_HIT=\0VICTORY_GROUP_SYNC=0\0tail".to_vec();
+    assert_ne!(without_bvh(&other), unset);
+}
+
+#[test]
 fn diagnostic_switches_leave_the_fingerprint_as_unset() {
     let unset = b"HASH\x00\x01VICTORY_DESC_WHY=\0VICTORY_GROUP_SYNC=2\0VICTORY_WAVE_WHY=\0tail".to_vec();
     let set = b"HASH\x00\x01VICTORY_DESC_WHY=1\0VICTORY_GROUP_SYNC=2\0VICTORY_WAVE_WHY=yes\0tail".to_vec();
@@ -483,7 +511,14 @@ fn cached(
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
     let started = std::time::Instant::now();
-    let input = [&build[..], container].concat();
+    // A program that tests rays is translated as the structure builder
+    // goes in this run ([`without_bvh`]).
+    let bvh: &[u8] = if crate::pipeline::container_walks(container) {
+        if victory_shader::emit::bvh_no_hit() { b"bvh no hit" } else { b"bvh tested" }
+    } else {
+        b""
+    };
+    let input = [&build[..], bvh, container].concat();
     let converter = Translate {
         translate,
         ran: AtomicBool::new(false),

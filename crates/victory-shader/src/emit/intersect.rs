@@ -63,8 +63,14 @@ fn no_hit() -> bool {
         #[cfg(test)]
         return TEST_NO_HIT.get();
     }
-    // Only while the builder is off (`VICTORY_BVH_BUILDER=0`; it runs by
-    // default), and not with `VICTORY_BVH_NO_HIT=0`.
+    no_hit_for_runs()
+}
+
+/// [`no_hit`] as a run has it: only while the builder is off
+/// (`VICTORY_BVH_BUILDER=0`; it runs by default), and not with
+/// `VICTORY_BVH_NO_HIT=0`. The host's shader cache keys the programs that
+/// test rays on it, and no others (`crate::emit::bvh_no_hit`).
+pub(in crate::emit) fn no_hit_for_runs() -> bool {
     std::env::var_os("VICTORY_BVH_NO_HIT").is_none_or(|v| v != "0")
         && std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "0")
 }

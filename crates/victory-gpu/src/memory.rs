@@ -83,6 +83,36 @@ unsafe impl Send for Memory {}
 
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
 
+/// Since the last frame line ([`frame_line`]): draws and dispatches that
+/// read title memory by address, copies brought up to date for them and
+/// their bytes, copies declared written by them and their bytes. What the
+/// structure builder costs the host when it runs: every such list brings
+/// every numbered copy up to date, and one that can store declares them
+/// all written (see the module).
+static COUNTS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// The line of title memory by address, once a frame-rate line; nothing
+/// while no shader has used it.
+pub(crate) fn frame_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let c = COUNTS.each_ref().map(|c| c.swap(0, Relaxed) as f64 / frames);
+    let Some((numbered, bytes)) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|m| {
+        (m.copies.len(), m.copies.iter().map(|s| s.span().1).sum::<u64>())
+    }) else {
+        return;
+    };
+    tracing::info!(
+        "title memory by address per frame: {:.0} draws and dispatches; {:.1} copies brought up to date for them ({:.0} MB), \
+         {:.1} declared written ({:.0} MB); copies numbered {numbered} ({} MB)",
+        c[0],
+        c[1],
+        c[2] / 1e6,
+        c[3],
+        c[4] / 1e6,
+        bytes >> 20,
+    );
+}
+
 /// What a draw binds.
 pub(crate) struct Ready {
     pub(crate) directory: u64,
@@ -298,13 +328,19 @@ pub(crate) fn ready(
     const WRITE: usize = usize::MAX - 0x6e;
     let first_read = list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
+    use std::sync::atomic::Ordering::Relaxed;
+    COUNTS[0].fetch_add(1, Relaxed);
     for (n, shadow) in m.copies.iter().enumerate() {
         let (start, len) = shadow.span();
         if first_read || n >= numbered {
             shadow.refresh(list, start, len);
+            COUNTS[1].fetch_add(1, Relaxed);
+            COUNTS[2].fetch_add(len, Relaxed);
         }
         if writes && (first_write || n >= numbered) {
             shadow.gpu_writes(list, start, len);
+            COUNTS[3].fetch_add(1, Relaxed);
+            COUNTS[4].fetch_add(len, Relaxed);
         }
     }
     if first_read {

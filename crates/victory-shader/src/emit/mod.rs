@@ -217,6 +217,17 @@ pub(crate) fn with_shader_opt<R>(passes: u32, f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Whether a run's translations answer every ray-tracing node test with
+/// "no hit" (the structure builder off): the only effect of
+/// `VICTORY_BVH_BUILDER` and `VICTORY_BVH_NO_HIT` on a translation, and
+/// only on programs that test rays. The host's cache takes the two out of
+/// [`translation_fingerprint`] and keys those programs on this instead, so
+/// a run with the builder on translates them alone again, not the whole
+/// pack.
+pub fn bvh_no_hit() -> bool {
+    lower::intersect::no_hit_for_runs()
+}
+
 /// Everything a translation depends on besides the container: the
 /// translator's own source (hashed at build time), the value of every
 /// `VICTORY_*` switch it reads, the host facts the device hands it (widest
