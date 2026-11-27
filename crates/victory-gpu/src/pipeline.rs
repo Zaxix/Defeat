@@ -523,6 +523,14 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// Why the last lookup of a host pipeline on this thread found none: true
+/// if the host refused it or a shader did not translate, false if it is
+/// still being made.
+#[cfg(windows)]
+pub(crate) fn last_missed_refused() -> bool {
+    make::last_miss() == make::MISS_REFUSED
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]

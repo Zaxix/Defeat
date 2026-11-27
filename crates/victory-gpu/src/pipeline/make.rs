@@ -204,24 +204,81 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         // here, or waited for while a worker makes it, instead of dropping
         // its dispatch after the frame's budget. `make` keeps its panic guard.
         let frame = crate::frame::current();
-        if p.graphics.is_none() && (compute_waits() || frame < 600) && compute_wait_left(frame) {
+        // A worker makes it and the title's thread waits for it, for at most
+        // what is left of the frame's limit: made on the title's thread, one
+        // compile took 14.6 s on the owner's PC (run 4, frame 2221), past a
+        // limit that was only asked before each compile.
+        if p.graphics.is_none()
+            && (compute_waits() || frame < 600)
+            && let Some(left) = compute_wait_left(frame)
+        {
             let started = Instant::now();
-            p.make();
+            wait_compute(p, left);
             compute_waited(frame, started.elapsed());
         } else {
             wait(p, frame);
         }
     }
-    let made = p.made.get()?.as_ref();
+    let made = match p.made.get() {
+        None => {
+            MISSED.set(MISS_MAKING);
+            return None;
+        }
+        Some(None) => {
+            MISSED.set(MISS_REFUSED);
+            return None;
+        }
+        Some(Some(made)) => made,
+    };
     // The first time the made pipeline goes to a draw or dispatch: noted
     // for a device removal's report (one load a call after that).
-    if let Some(host) = made
-        && !p.handed.load(Ordering::Relaxed)
-        && !p.handed.swap(true, Ordering::Relaxed)
-    {
-        crate::host::first_use(&host.name);
+    if !p.handed.load(Ordering::Relaxed) && !p.handed.swap(true, Ordering::Relaxed) {
+        crate::host::first_use(&made.name);
     }
-    made
+    Some(made)
+}
+
+/// [`last_miss`]: the pipeline is still being made.
+pub(crate) const MISS_MAKING: u8 = 1;
+/// [`last_miss`]: the host refused it, or a shader of it did not translate.
+pub(crate) const MISS_REFUSED: u8 = 2;
+
+thread_local! {
+    static MISSED: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// Why the last [`ready`] on this thread found no host pipeline
+/// ([`MISS_MAKING`], [`MISS_REFUSED`]; 0 before any): for the frame line's
+/// dropped draws by why, in release builds too.
+pub(crate) fn last_miss() -> u8 {
+    MISSED.get()
+}
+
+/// Waits for compute pipeline `p` for at most `left`: at the front of the
+/// workers' queue if no worker has taken it yet, so that the next free
+/// worker makes it; made on this thread if there are no workers.
+/// Before (run 4), the title's thread made it itself: a limit asked only
+/// before each compile, and one thread compiling while the workers had
+/// the cores.
+fn wait_compute(p: &Arc<Pending>, left: Duration) {
+    if !workers() {
+        p.make();
+        return;
+    }
+    {
+        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        queue.hurry(p);
+    }
+    let started = Instant::now();
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() {
+        let rest = left.saturating_sub(started.elapsed());
+        if rest.is_zero() {
+            break;
+        }
+        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+    }
 }
 
 /// Whether a dispatch waits for its compute pipeline until it is made,
@@ -276,18 +333,19 @@ fn compute_wait_most() -> Option<Duration> {
 /// sooner, never later).
 static COMPUTE_SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
 
-/// Whether frame `frame` may still make a compute pipeline on the title's
-/// thread ([`compute_wait_most`]).
-fn compute_wait_left(frame: u64) -> bool {
+/// What frame `frame` may still wait for compute pipelines
+/// ([`compute_wait_most`]; an hour without a limit); `None` past it.
+fn compute_wait_left(frame: u64) -> Option<Duration> {
     let Some(most) = compute_wait_most() else {
-        return true;
+        return Some(Duration::from_secs(3600));
     };
     left_in(&COMPUTE_SPENT.lock().unwrap_or_else(|e| e.into_inner()), frame, most)
 }
 
 /// [`compute_wait_left`] on a count `spent` (frame, time) and limit `most`.
-fn left_in(spent: &(u64, Duration), frame: u64, most: Duration) -> bool {
-    spent.0 != frame || spent.1 < most
+fn left_in(spent: &(u64, Duration), frame: u64, most: Duration) -> Option<Duration> {
+    let left = if spent.0 == frame { most.saturating_sub(spent.1) } else { most };
+    (!left.is_zero()).then_some(left)
 }
 
 /// Adds `took` to the count `spent` for frame `frame` (a new frame starts
@@ -430,12 +488,46 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
-/// run drew with it (during loading, so the world's first frames find it).
+/// run drew with it (during loading, so the world's first frames find it),
+/// and a compute pipeline in any case ([`compute_early`]).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if p.shaders.is_empty() {
+        return;
+    }
+    if super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
+    } else if p.graphics.is_none() && compute_early() {
+        COMPUTE_EARLY.fetch_add(1, Ordering::Relaxed);
+        start(p, EARLY);
     }
+}
+
+/// Compute pipelines started at their creation that no earlier run used.
+pub(crate) static COMPUTE_EARLY: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a compute pipeline no earlier run used is started at its
+/// creation (behind the queue of requested ones, as the library's are),
+/// not at its first dispatch.
+///
+/// Why: the title creates its compute pipelines while it loads and runs
+/// many of them first in a scene's opening frames, where each was made
+/// then, one after another, while the frame waited. In run 4 on the
+/// owner's PC (RTX 4070, 5800X) the first cutscene frames waited 13.6 and
+/// 14.6 s for four compute pipelines created a minute before (programs of
+/// 12 to 66 KB): the 12 workers had been idle. Compute pipelines are the
+/// fewer and the larger (835 of the run's 2,229 first binds; graphics
+/// ones stay started at first use, being many more and cheap). The made
+/// ones go to the pipeline library as any other.
+/// On by default; `VICTORY_PIPELINE_COMPUTE_EARLY=0`: at first dispatch,
+/// as before.
+fn compute_early() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_PIPELINE_COMPUTE_EARLY").is_none_or(|v| v != "0");
+        tracing::info!(on, "compute pipelines started at their creation (VICTORY_PIPELINE_COMPUTE_EARLY)");
+        on
+    })
 }
 
 /// Whether the frame's budget is one for all threads together: a thread
@@ -540,6 +632,20 @@ impl Queue {
         Some(prev == NOT_QUEUED)
     }
 
+    /// Moves requested pipeline `p` to the front of the queue if no worker
+    /// has taken it yet.
+    fn hurry(&mut self, p: &Arc<Pending>) {
+        if p.queue_state.load(Ordering::Relaxed) != REQUESTED {
+            return;
+        }
+        if let Some(at) = self.requested.iter().position(|q| Arc::ptr_eq(q, p))
+            && at > 0
+            && let Some(q) = self.requested.remove(at)
+        {
+            self.requested.push_front(q);
+        }
+    }
+
     fn pop(&mut self) -> Option<Arc<Pending>> {
         let p = self.requested.pop_front().or_else(|| {
             // An early entry can have been promoted and claimed already.
@@ -635,6 +741,7 @@ fn drained() {
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            compute_started_early = COMPUTE_EARLY.load(Ordering::Relaxed),
             "host pipelines all made"
         );
     }
@@ -652,15 +759,36 @@ mod tests {
     fn a_frame_stops_waiting_for_compute_pipelines_at_the_limit() {
         let most = Duration::from_secs(10);
         let mut spent = (u64::MAX, Duration::ZERO);
-        assert!(left_in(&spent, 7, most));
+        assert_eq!(left_in(&spent, 7, most), Some(most));
         assert!(!add_to(&mut spent, 7, Duration::from_secs(9), most));
-        assert!(left_in(&spent, 7, most), "under the limit");
+        assert_eq!(left_in(&spent, 7, most), Some(Duration::from_secs(1)), "what is left of the limit");
         assert!(add_to(&mut spent, 7, Duration::from_secs(2), most), "said once, when the limit is reached");
-        assert!(!left_in(&spent, 7, most), "past the limit");
+        assert_eq!(left_in(&spent, 7, most), None, "past the limit");
         assert!(!add_to(&mut spent, 7, Duration::from_secs(1), most), "not said again");
-        assert!(left_in(&spent, 8, most), "a new frame waits again");
+        assert_eq!(left_in(&spent, 8, most), Some(most), "a new frame waits again");
         assert!(!add_to(&mut spent, 8, Duration::from_millis(1), most));
-        assert!(left_in(&spent, 8, most));
+        assert_eq!(left_in(&spent, 8, most), Some(most - Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn a_hurried_pipeline_goes_to_the_front_unless_taken() {
+        let [a, b, c] = [(); 3].map(|()| Arc::new(Pending::new(Vec::new(), None)));
+        let mut queue = Queue::new();
+        for p in [&a, &b, &c] {
+            assert_eq!(queue.push(p, REQUESTED), Some(true));
+        }
+        queue.hurry(&c);
+        let order: Vec<_> = queue.requested.iter().map(Arc::as_ptr).collect();
+        assert_eq!(order, [Arc::as_ptr(&c), Arc::as_ptr(&a), Arc::as_ptr(&b)]);
+        let taken = queue.pop().expect("one queued");
+        assert!(Arc::ptr_eq(&taken, &c));
+        queue.hurry(&c);
+        assert_eq!(queue.requested.len(), 2, "a taken pipeline is not queued again");
+        // An early one hurried is left where it is (only requested ones are).
+        let d = Arc::new(Pending::new(Vec::new(), None));
+        assert_eq!(queue.push(&d, EARLY), Some(true));
+        queue.hurry(&d);
+        assert!(Arc::ptr_eq(queue.requested.front().expect("queued"), &a));
     }
 
 
