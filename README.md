@@ -23,8 +23,12 @@ research checklist means what it says.
 > placement: nothing moves). Streaming: each DirectStorage worker keeps its
 > buffers between requests (`VICTORY_DSTORAGE_SCRATCH_MB=0` for fresh ones);
 > `VICTORY_DSTORAGE_WORKERS` and `VICTORY_PIPELINE_WORKERS` set the two pools'
-> sizes for thread-count tests (defaults unchanged: 16 and 12 on a 5800X). Research notes: `docs/RESEARCH_CHECKLIST.md`.
-> None of it has been run in the game on that PC yet.
+> sizes for thread-count tests (defaults unchanged: 16 and 12 on a 5800X). Pipelines: a frame waits at
+> most 10 s in all for new compute pipelines, so the title's hang watchdog does not fire
+> (`VICTORY_PIPELINE_COMPUTE_WAIT_MS`); compute pipelines no earlier run used are made in the background
+> on 2 workers from their creation (`VICTORY_PIPELINE_COMPUTE_EARLY`, a worker count, 0 off); the frame
+> line says why draws were dropped. Research notes: `docs/RESEARCH_CHECKLIST.md`. Results on that PC:
+> [below](#status-on-the-owners-pc-ryzen-7-5800x--rtx-4070).
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
 compatibility layer that runs an Xbox Series title natively on Windows from
@@ -54,7 +58,33 @@ developer or publisher.
   are carried here unchanged apart from one merge conflict.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
-## Status of this fork (2026-11-27, 03:45 UTC)
+## Status on the owner's PC (Ryzen 7 5800X + RTX 4070)
+
+Ryzen 7 5800X (8 cores, 16 threads), NVIDIA RTX 4070 12 GB (Resizable BAR on, PCIe 4.0 x16), 64 GB
+DDR4-3600, Windows. Series X profile; ray-tracing structure builder off (`VICTORY_BVH_BUILDER=0`, see
+below). Each run's log is read in full and recorded in `docs/RESEARCH_CHECKLIST.md` (implementation
+status table).
+
+| Run (2026-11-27) | Got to | Frame rate | What the log showed | Fixed since |
+|---|---|---|---|---|
+| 1 | Title screen, menu, intro; crashed loading into the world | 30 fps in menus | The title's hang watchdog fired: one frame compiled ~950 new pipelines, the compute ones one by one on the title's thread | A frame waits at most 10 s for new compute pipelines |
+| 2 | The world (black, lights only) | 0.1–0.3 fps | ~2,100 pipelines asked for a minute, ~365 made; up to 3,400 draws a frame dropped waiting for them; CPU 100 % | — (caches warming) |
+| 3 | The world at night: city lights, the character | ~0.2–1 fps | No shader-cache hits: an edit of ours had changed the cache key; video memory at its budget (~10.9 GB), ~23,000 texture slots waiting for room | Cache key frozen (`shader_cache.key`) |
+| 4 | First story cutscene, with sound; very dark | 0.1–1.8 fps | Caches work (1,509 shader hits, 1,698 pipelines from the library); two frames waited 13.6 and 14.6 s for four compute pipelines; card at 10.2–11.9 GB of a ~10.4 GB budget | Compute pipelines started at creation (overdone, see run 5); a true 10 s limit; drop reasons logged |
+| 5 | Further into the cutscene; people visible, faces black | 0.1–2 fps in the world | Dropped draws are now ~all the switched-off ray-tracing builder's; compute-at-creation queued ~2,900 pipelines on all 12 workers, CPU 99 % for the whole run, and everything CPU-side (copy-back 260–1,000 ms, texture refreshes up to 1.7 s waiting on title remaps, the heap pass) slowed with it; 12 compute pipelines refused by the driver, 5 compute shaders do not translate | Spare compute pipelines on at most 2 workers, last; a refused pipeline logs the wave size it asks for |
+
+**Why the picture is dark:** the game lights much of its scene with ray tracing (bounce light, lamp
+and sun shadows). With the builder off nothing is traced, so whatever direct light does not reach is
+black (the gta6 base sees the same on its PC, below). Texture slots also wait for room on a full card
+(about 20,000 in run 5; run 295 of the base found the same). Black faces may be one of these or the
+skin pass; not known yet.
+
+**What limits the frame rate now:** the CPU. In run 5 the card was busy about a quarter of the time.
+
+## Status of the gta6 base on its tester's PC (fxceless; inherited, 2026-11-27, 03:45 UTC)
+
+The rest of this section is the base fork's own record, kept as it was: another PC (i7-14700KF,
+RTX 4070, 32 GB) and, where it says so, its own switch set, not Defeat's defaults on the owner's PC.
 
 **Playable, slowly: about 11 world frames per second at the first boat mission at 1,500 to 3,300
 draws (usual frame 88 ms), 8.5 at 3,300 and more (115 to 120 ms); the console runs 30. The card is no
