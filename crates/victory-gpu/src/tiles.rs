@@ -786,6 +786,22 @@ pub(crate) fn status() {
     }
     let calls = s[6] - BEFORE[0].swap(s[6], Ordering::Relaxed);
     let micros = s[7] - BEFORE[1].swap(s[7], Ordering::Relaxed);
+    // How full the pool's heaps are (R59: occupancy before any reclaim):
+    // heaps, free tiles, heaps with none given, the longest free run.
+    let (heaps, free, empty, longest) = {
+        let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        pool.iter().flatten().fold((0u64, 0u64, 0u64, 0u32), |(h, f, e, l), heap| {
+            let free = heap.free_tiles();
+            let run = heap.free.iter().map(|r| r.1).max().unwrap_or(0);
+            (h + 1, f + u64::from(free), e + u64::from(free == HEAP_TILES), l.max(run))
+        })
+    };
+    tracing::info!(
+        "the levels' pool: {heaps} heaps of {} MB, {} MB of their tiles free ({empty} heaps wholly free), the longest free run {} KB",
+        (u64::from(HEAP_TILES) * TILE) >> 20,
+        (free * TILE) >> 20,
+        (u64::from(longest) * TILE) >> 10,
+    );
     tracing::info!(
         "textures with levels on demand: {} alive ({} made so far), {} MB of the card given to {} levels in all, \
          {} MB of the card not allocated for levels the title does not hold ({} MB if every level had memory); \

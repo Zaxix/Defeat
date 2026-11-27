@@ -89,7 +89,7 @@ pub(crate) fn fast() -> bool {
             if on {
                 "ON (=0 puts them all back to off)"
             } else {
-                "off, as in runs 1-9"
+                "off, as in runs 1-9 (and the switches added since)"
             },
             if set.is_empty() {
                 "none".to_owned()

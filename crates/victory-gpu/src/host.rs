@@ -4594,7 +4594,7 @@ mod fill_check {
 }
 
 /// Whether a submission's passes over its lists' steps find a step's copy
-/// by an index instead of a search (`VICTORY_STEP_INDEX=1`; off by default;
+/// by an index instead of a search (`VICTORY_STEP_INDEX`; on unless `=0`;
 /// `alt`: twenty seconds with, twenty without, in turn, each change said in
 /// the log). The same copies, ranges and order come out
 /// ([`declared_by_index`], [`stale_under_flights`]); what goes is a lock
@@ -5152,6 +5152,7 @@ fn relay_worker() {
         return;
     };
     crate::framelog::keep_on_fast_cores("victory-relay");
+    crate::framelog::raise_priority("victory-relay");
     // SAFETY: a plain event of our own.
     let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
         fail(format_args!("no event for the thread that lands submissions sent ahead (VICTORY_RELAY=1)"));
@@ -10502,8 +10503,8 @@ pub(crate) fn list_reuse() -> bool {
 }
 
 /// Whether a list's fills of under 256 bytes are copied in place
-/// (`VICTORY_FILLS_PLAIN=1`, with `VICTORY_COPY_PLAIN=1`; off by default:
-/// through the kernel's copy, as before). `alt`: twenty seconds with,
+/// (`VICTORY_FILLS_PLAIN`, with `VICTORY_COPY_PLAIN`; on unless `=0`,
+/// which goes through the kernel's copy, as before). `alt`: twenty seconds with,
 /// twenty without, in turn, each change said in the log.
 ///
 /// A fill copies constants the title recorded a draw with into upload

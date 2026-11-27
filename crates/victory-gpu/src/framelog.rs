@@ -294,6 +294,28 @@ pub fn slow_processors() -> usize {
     sets.iter().filter(|c| c.2 < best && c.1 < usize::BITS as u8).fold(0, |mask, c| mask | 1usize << c.1)
 }
 
+/// Raises the calling thread a step above normal priority
+/// (`VICTORY_OUR_PRIORITY=0`: left as it is): for the submitting and the
+/// copy-back threads, whose work the frame waits for. Run 12 had the card
+/// idle 58 ms a frame behind the submitting thread; the title pins its own
+/// threads (on the console's eight cores' worth of processors), and the
+/// pipeline, DirectStorage and helper workers (12 to 16 each on a 5800X)
+/// are at normal priority, so the frame's own thread waited its turn
+/// among them whenever all were busy.
+pub fn raise_priority(what: &str) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_OUR_PRIORITY").is_none_or(|v| v != "0")) {
+        return;
+    }
+    // SAFETY: our own thread.
+    if unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) } == 0 {
+        tracing::warn!(what, error = %std::io::Error::last_os_error(), "the thread's priority could not be raised");
+    } else {
+        tracing::info!(what, "the thread runs above normal priority (VICTORY_OUR_PRIORITY=0: not)");
+    }
+}
+
 /// Asks the system to run the calling thread on the fast cores only, where
 /// the processor has two kinds (`VICTORY_FAST_CORES=0`: not asked).
 ///
