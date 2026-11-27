@@ -1044,6 +1044,24 @@ fn wait_for(resource: usize, handle: u64) {
     }
 }
 
+/// Makes again, in every view heap, the slots of textures whose first level
+/// with memory changed (`host::views_remade_idle`). For the submitting
+/// thread, under the submission lock, before a submission starts and with
+/// nothing of ours on the card. Returns the slots made again.
+#[cfg(windows)]
+pub(crate) fn views_remade_idle() -> usize {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    self::host::views_remade_idle(heaps.iter().filter_map(|&(_, _, at)| {
+        // SAFETY: registered heaps are live (removed when dropped), and the
+        // registry's read lock is held through the call.
+        let heap: &'static Heap = unsafe { &*(at as *const Heap) };
+        match heap.host.get() {
+            Some(Some(host)) => Some(host),
+            _ => None,
+        }
+    }))
+}
+
 /// Makes the host slots that waited for a texture's host copy, for the
 /// textures made since the last call. Called before a submission runs, by
 /// the thread that submits: a slot is read when a list runs.

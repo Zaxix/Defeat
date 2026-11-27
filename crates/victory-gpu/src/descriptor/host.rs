@@ -298,8 +298,15 @@ static RESHOWN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
 /// Since the start, of [`HostHeap::texture_views_remade`]: view slots made
 /// again, those of them made while a submission was in flight, and passes
-/// put off because one was (`VICTORY_VIEWS_REMADE_QUIET=1`).
+/// put off because one was (`VICTORY_VIEWS_REMADE_QUIET=1`, and every pass
+/// by default: [`views_remade_mode`]).
 static VIEWS_REMADE: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Of the slots made again at a moment with nothing in the air
+/// ([`views_remade_idle`]): when ([`crate::host::now_ms`], plus one) the
+/// oldest change still waiting was noted, 0 while none waits; and the
+/// longest wait so far, in milliseconds.
+static REMADE_WAIT: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// [`VIEWS_REMADE`]'s first two counts (slots made again; those made again
 /// under a flight), for the seconds a device removal's report says.
@@ -307,21 +314,92 @@ pub(crate) fn views_remade() -> [u64; 2] {
     [0, 1].map(|i| VIEWS_REMADE[i].load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// Whether view slots of textures with levels on demand are made again
-/// only while no submission is in flight (`VICTORY_VIEWS_REMADE_QUIET=1`;
-/// off by default: at every texture pass, as before). A texture then
-/// shows its new level a pass or more later. After fork pull request
-/// #1219, whose author lost the device with slots rewritten under lists
-/// already sent; whether that is behind the losses here is not known.
-fn views_remade_quiet() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEWS_REMADE_QUIET").is_some_and(|v| v == "1"))
+/// When view slots of textures with levels on demand are made again
+/// (`VICTORY_VIEWS_REMADE_QUIET`):
+///
+/// - [`REMADE_AT_PASS`] (`0`): at every texture pass, as before, while
+///   lists already sent may be running and reading the slots;
+/// - [`REMADE_QUIET`] (`1`): at a texture pass that finds no submission
+///   in flight, else put off to a later pass (fork pull request #1219,
+///   whose author lost the device with slots rewritten under lists
+///   already sent); with the relay a pass mostly finds one in flight, and
+///   the slots may wait long;
+/// - [`REMADE_AT_IDLE`] (unset, the default): by the submitting thread,
+///   under the submission lock, at the moment before a submission starts
+///   when nothing of ours is in the air (the sweep's moment:
+///   `crate::host`'s `submit`, at least every 1.5 s with the relay, at
+///   every submission without it) — of every view heap, not only of the
+///   one whose pass ran first.
+///
+/// Direct3D 12 asks that a descriptor a submitted list may read is left
+/// alone until the list has run; only the last way keeps to that. A slot
+/// made again shows the same texture from another first level (the one
+/// with memory now), so a slot that waits shows the levels it showed.
+/// Whether the rewrites are behind the late device losses is not known;
+/// `VIEWS_REMADE[1]` (slots made again with a submission in flight) stays 0
+/// with the default, and the device-removal report's seconds hold it.
+fn views_remade_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_VIEWS_REMADE_QUIET").as_deref().map(str::trim) {
+        Ok("0") => REMADE_AT_PASS,
+        Ok("1") => REMADE_QUIET,
+        _ => REMADE_AT_IDLE,
+    })
+}
+
+/// [`views_remade_mode`]'s ways.
+const REMADE_AT_PASS: u8 = 0;
+const REMADE_QUIET: u8 = 1;
+const REMADE_AT_IDLE: u8 = 2;
+
+/// For the log: the way slots are made again.
+fn views_remade_text() -> &'static str {
+    match views_remade_mode() {
+        REMADE_AT_PASS => "at every pass, lists in flight or not (VICTORY_VIEWS_REMADE_QUIET=0)",
+        REMADE_QUIET => "at a pass with no submission in flight (VICTORY_VIEWS_REMADE_QUIET=1)",
+        _ => "before a submission starts with nothing in the air (the default; VICTORY_VIEWS_REMADE_QUIET=0 or 1 for the others)",
+    }
 }
 
 /// The first level with memory of the placed texture at `start` changed:
-/// its slots are made again at the next texture pass.
+/// its slots are made again at the next texture pass, or with nothing in
+/// the air ([`views_remade_mode`]).
 pub(crate) fn levels_changed(start: u64) {
-    RESHOWN.lock().unwrap_or_else(|e| e.into_inner()).push(start);
+    let mut reshown = RESHOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if reshown.is_empty() {
+        REMADE_WAIT[0].store(crate::host::now_ms() + 1, std::sync::atomic::Ordering::Relaxed);
+    }
+    reshown.push(start);
+}
+
+/// Takes the textures whose slots are due to be made again, noting how
+/// long the oldest of them waited ([`REMADE_WAIT`]).
+fn take_reshown() -> Vec<u64> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut reshown = RESHOWN.lock().unwrap_or_else(|e| e.into_inner());
+    let since = REMADE_WAIT[0].swap(0, Relaxed);
+    if since != 0 && !reshown.is_empty() {
+        REMADE_WAIT[1].fetch_max(crate::host::now_ms().saturating_sub(since - 1), Relaxed);
+    }
+    std::mem::take(&mut *reshown)
+}
+
+/// With the default way ([`views_remade_mode`]): makes the slots of the
+/// textures due again in every view heap. For the submitting thread,
+/// under the submission lock, before a submission starts and with nothing
+/// of ours on the card (no list that may read a slot is running). Returns
+/// the slots made again.
+#[cfg(windows)]
+pub(crate) fn views_remade_idle(heaps: impl IntoIterator<Item = &'static HostHeap>) -> usize {
+    if views_remade_mode() != REMADE_AT_IDLE {
+        return 0;
+    }
+    let starts = take_reshown();
+    if starts.is_empty() {
+        return 0;
+    }
+    let flying = crate::host::submissions_in_flight();
+    heaps.into_iter().map(|heap| heap.remake_views(&starts, flying)).sum()
 }
 
 /// Levels on demand (`crate::tiles`): where the placed textures start
@@ -1770,18 +1848,29 @@ impl HostHeap {
         // reads, and the making is the layer's own, at a moment the title
         // knows nothing of: a list already sent may be reading a slot while
         // it is written (Direct3D 12 asks that a descriptor a submitted
-        // list reads is left alone until the list has run). Counted always;
-        // with `VICTORY_VIEWS_REMADE_QUIET=1` the pass is put off while a
-        // submission is in flight, and what is due stays due.
+        // list reads is left alone until the list has run). By default the
+        // pass leaves them to the moment before a submission starts with
+        // nothing in the air ([`views_remade_idle`]); with
+        // `VICTORY_VIEWS_REMADE_QUIET=1` it makes them only when it finds
+        // no submission in flight, and what is due stays due.
         let flying = crate::host::submissions_in_flight();
-        if flying > 0 && views_remade_quiet() {
+        let mode = views_remade_mode();
+        if mode == REMADE_AT_IDLE || (flying > 0 && mode == REMADE_QUIET) {
             if !RESHOWN.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
                 VIEWS_REMADE[2].fetch_add(1, Relaxed);
             }
             return 0;
         }
-        let starts = std::mem::take(&mut *RESHOWN.lock().unwrap_or_else(|e| e.into_inner()));
-        if starts.is_empty() {
+        let starts = take_reshown();
+        self.remake_views(&starts, flying)
+    }
+
+    /// Makes this heap's slots of the placed textures at `starts` again
+    /// from the views they hold; `flying`: submissions in flight now (for
+    /// the count). Returns the slots made again.
+    fn remake_views(&self, starts: &[u64], flying: u64) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.sampler || starts.is_empty() {
             return 0;
         }
         let slots: Vec<u32> = {
@@ -1813,11 +1902,13 @@ impl HostHeap {
         if (before + remade as u64) / 1024 != before / 1024 {
             tracing::info!(
                 "view slots of textures with levels on demand made again, since the start: {}, {} of them while a submission was in flight \
-                 (a list already sent may have been reading the slot); {} passes put off for that (VICTORY_VIEWS_REMADE_QUIET=1: {})",
+                 (a list already sent may have been reading the slot); {} passes put off; the longest a change waited for its slots: {} ms; \
+                 made {}",
                 before + remade as u64,
                 VIEWS_REMADE[1].load(Relaxed),
                 VIEWS_REMADE[2].load(Relaxed),
-                if views_remade_quiet() { "on" } else { "off" }
+                REMADE_WAIT[1].load(Relaxed),
+                views_remade_text()
             );
         }
         remade
