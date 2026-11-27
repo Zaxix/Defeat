@@ -1238,7 +1238,9 @@ impl HostHeap {
         ));
         let strides = (!sampler)
             .then(|| {
-                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4;
+                // The strides, then each slot's title address (two dwords;
+                // `victory_shader::emit::SLOT_ADDRESSES_AT`).
+                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 12;
                 let (buffer, data) = host.upload_buffer(bytes)?;
                 // SAFETY: the buffer's whole mapping; a live buffer.
                 let gpu = unsafe {
@@ -2118,6 +2120,18 @@ impl HostHeap {
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+            // The address, for programs that pick the view by a computed
+            // index and walk the memory behind it themselves. A shader can
+            // read the halves of two writes when the title rewrites a slot
+            // it reads in flight; the console's would be as stale.
+            let address = view.and_then(view_address).unwrap_or(0);
+            let at = (victory_shader::emit::SLOT_ADDRESSES_AT / 4 + index * 2) as usize;
+            // SAFETY: inside the mapping (`index` is below the count).
+            unsafe {
+                let words = (*data as *mut u32).add(at);
+                words.write_volatile(address as u32);
+                words.add(1).write_volatile((address >> 32) as u32);
+            }
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
@@ -2976,6 +2990,21 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
 
 /// The title memory a buffer shader or unordered access view reads: its
 /// address and length.
+/// The title address a heap slot's view names, for a program that reads it
+/// as the first two dwords of the console's descriptor: a ray-tracing
+/// structure's location (dimension 11, words 4 and 5 of the description)
+/// or the first byte of a buffer view.
+fn view_address(view: &View) -> Option<u64> {
+    // D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE
+    const STRUCTURE: u32 = 11;
+    if let View::Shader(_, Some(desc)) = view
+        && desc[1] == STRUCTURE
+    {
+        return Some(u64::from(desc[4]) | u64::from(desc[5]) << 32).filter(|&a| a != 0);
+    }
+    buffer_range(view).map(|r| r.0)
+}
+
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     let (base, words): (u64, &[u32; 10]) = match view {
         View::Shader(r, Some(desc)) => (
@@ -4107,6 +4136,20 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A ray-tracing structure's slot holds its location for programs that
+    /// read it as an address; one with no location holds none.
+    #[test]
+    fn a_structure_slot_holds_its_location() {
+        let mut desc = [0u32; 10];
+        desc[1] = 11;
+        desc[4] = 0x1234_5000;
+        desc[5] = 0x7;
+        assert_eq!(view_address(&View::Shader(0, Some(desc))), Some(0x7_1234_5000));
+        desc[4] = 0;
+        desc[5] = 0;
+        assert_eq!(view_address(&View::Shader(0, Some(desc))), None);
+    }
 
     /// A range of dynamic slots is given back only to the heap that took it:
     /// the title can release a heap while a list still holds slots of it,

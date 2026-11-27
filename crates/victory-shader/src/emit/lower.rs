@@ -2834,6 +2834,51 @@ impl<'a> Lower<'a> {
         Some((lo, hi))
     }
 
+    /// The title address of the buffer view a scalar load at `site` picks
+    /// from the view heap by a computed index: two dwords of the host's
+    /// table at [`super::shader::SLOT_ADDRESSES_AT`] in the
+    /// [`super::shader::SLOT_STRIDES`] buffer. `None` for a load that does
+    /// not read the view heap.
+    fn heap_view_address(&mut self, site: Site) -> Result<Option<(V, V)>, Why> {
+        use super::shader::{SLOT_ADDRESSES_AT, SLOT_STRIDES, SLOT_STRIDES_COUNT};
+        let heap = self
+            .scalar
+            .get(&site)
+            .and_then(|a| self.x.native.layout.get(a.param))
+            .is_some_and(|p| p.root == RootType::ResourceHeap);
+        if !heap {
+            return Ok(None);
+        }
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let slot = self.heap_index(site, 0, false)?;
+        // Inside the table whatever the index, as for the strides.
+        let last = self.s.m.i32(SLOT_STRIDES_COUNT - 1);
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        self.s.m.tag(slot, Tag::Clamp);
+        let three = self.s.m.i32(3);
+        let byte = self.s.m.bin(c, Bin::Shl, slot, three);
+        let at = self.s.m.i32(SLOT_ADDRESSES_AT);
+        let byte = self.s.m.bin(c, Bin::Add, byte, at);
+        let h = self.s.root_srv_handle(SLOT_STRIDES);
+        let iu = self.s.m.undef(i32t);
+        let mask = self.s.m.i8(3);
+        let align = self.s.m.i32(4);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, byte, iu, mask, align],
+        );
+        let lo = self.s.m.extract(c, r, 0);
+        let hi = self.s.m.extract(c, r, 1);
+        let lo = self.as_int(lo);
+        let hi = self.as_int(hi);
+        Ok(Some((lo, hi)))
+    }
+
     /// `lo`, `hi` plus the instruction's byte offset `off`, with the carry.
     fn address_plus(&mut self, lo: V, hi: V, off: i32) -> (V, V) {
         if off == 0 {
@@ -6149,6 +6194,28 @@ impl<'a> Lower<'a> {
             // from the host, the other dwords have no value.
             if count <= 4
                 && let Some((lo, hi)) = self.view_address(site)
+            {
+                for k in 0..count {
+                    let reg = Reg::S(code + k as u8);
+                    match k {
+                        0 => self.write(inst, reg, lo, None),
+                        1 => self.write(inst, reg, hi, None),
+                        _ => {
+                            if let Some(v) = inst.write(reg) {
+                                self.vals.insert(v, Val::Missing(OTHER));
+                                self.stale.insert(v);
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            // The same picked from the heap by a computed index (the
+            // shadow-ray programs' structure, by an index in their
+            // constants): the host keeps each slot's address beside its
+            // stride, and dwords 2 and 3 have no value here either.
+            if count <= 4
+                && let Some((lo, hi)) = self.heap_view_address(site)?
             {
                 for k in 0..count {
                     let reg = Reg::S(code + k as u8);

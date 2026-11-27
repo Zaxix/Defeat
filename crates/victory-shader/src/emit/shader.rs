@@ -46,6 +46,13 @@ pub const LAUNCH_SPACE: u32 = 9;
 pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// The byte offset in the [`SLOT_STRIDES`] buffer of its second table: two
+/// dwords per heap slot, the low and high halves of the title address of the
+/// buffer view (or ray-tracing structure) at that slot, 0 for none. A program
+/// that picks a descriptor from the heap by a computed index and reads only
+/// its first two dwords, as the address of memory it walks itself, reads
+/// them here: the host's view holds the address, not the console's dwords.
+pub const SLOT_ADDRESSES_AT: u32 = SLOT_STRIDES_COUNT * 4;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
