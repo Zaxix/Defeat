@@ -1073,6 +1073,47 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// Dropped draws and dispatches by why, since the last [`take_drop_why`]
+/// (release builds too; diagnostics builds list them by pipeline): a
+/// stage of the ray-tracing structure builder while it is off, a pipeline
+/// still being made, one the host refused or that did not translate, one
+/// whose views or tables could not be bound, anything else.
+/// Why: run 4 dropped 330 to 1,070 draws a frame with no pipeline being
+/// made, and a release build's frame line could not say why.
+static DROP_WHY: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+const WHY_BUILDER: usize = 0;
+const WHY_MAKING: usize = 1;
+const WHY_REFUSED: usize = 2;
+const WHY_UNBOUND: usize = 3;
+const WHY_OTHER: usize = 4;
+
+thread_local! {
+    /// Why the draw being prepared on this thread cannot run
+    /// ([`State::prepare_for`]), for [`drop_noted`].
+    static WHY: std::cell::Cell<usize> = const { std::cell::Cell::new(WHY_OTHER) };
+}
+
+fn drop_for(why: usize) {
+    DROPPED.fetch_add(1, Ordering::Relaxed);
+    DROP_WHY[why].fetch_add(1, Ordering::Relaxed);
+}
+
+/// A draw dropped for the why [`State::prepare_for`] noted.
+fn drop_noted() {
+    drop_for(WHY.get());
+}
+
+/// [`WHY_MAKING`] or [`WHY_REFUSED`], for a lookup of a host pipeline
+/// that found none.
+fn missing_pipeline() -> usize {
+    if crate::pipeline::last_missed_refused() { WHY_REFUSED } else { WHY_MAKING }
+}
+
+/// [`DROP_WHY`] since the last call, and from now counted again.
+pub(crate) fn take_drop_why() -> [u64; 5] {
+    [0, 1, 2, 3, 4].map(|i| DROP_WHY[i].swap(0, Ordering::Relaxed))
+}
+
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
 fn dropped(pipeline: usize) {
@@ -1581,11 +1622,13 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+        WHY.set(WHY_OTHER);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
         let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats) else {
+            WHY.set(missing_pipeline());
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -1597,6 +1640,7 @@ impl State {
             once!("a rectangle pipeline drawn with another topology");
         }
         if !self.bind(list, p, false) {
+            WHY.set(WHY_UNBOUND);
             return false;
         }
         let l = &list.list;
@@ -3371,7 +3415,7 @@ impl State {
         self.dispatch_ends(list);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            drop_for(WHY_OTHER);
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
@@ -3383,7 +3427,7 @@ impl State {
         }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            drop_for(WHY_BUILDER);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
@@ -3396,7 +3440,7 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            drop_for(missing_pipeline());
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
@@ -3445,7 +3489,7 @@ impl State {
         self.dispatch_spread = [0, 0];
         self.dispatch_threads = [0; 3];
         if !bound {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            drop_for(WHY_UNBOUND);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -3758,7 +3802,7 @@ impl State {
                 Err(_) => false,
             };
         if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            drop_noted();
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -4319,7 +4363,7 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            drop_noted();
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -4422,7 +4466,7 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            drop_noted();
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
