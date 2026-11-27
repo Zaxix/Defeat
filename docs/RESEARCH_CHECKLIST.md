@@ -7,6 +7,47 @@
 > **Snapshot (2026-11-27):** default branch `main` at `fc093e2ca81095d9c090fdfe99b79353030c5984`. Experimental branches include `exact-lock`, `loose-lock`, `shader-licm`, `texture-digest`, `gpu-access-costs`, `gpu-access-flags`, `merge-words`, `dstorage-before-write`, and `gta6`. Branches **diverge** from main; a commit's presence on an experiment branch does **not** mean it is deployed on main. Re-check ancestry and latest head before each investigation.
 
 
+## IMPLEMENTATION STATUS — Claude-owned (updated 2026-11-27 08:25 UTC; code on \`main\` up to \`2364a29\`)
+
+> **Single source of truth for what is built.** Research text below is unchanged; this table says what of it exists in code on \`main\`, what was tested where, and what each item's gate still needs. Claude keeps this section current; research edits elsewhere are welcome. A box below is ticked only when its own "Done when" gate is met: most gates need the game running on the owner's PC, so most items stay open even when their code is merged.
+>
+> **Legend:** ✅ gate met · 🟢 on \`main\`, built and unit-tested on the owner's PC, needs an in-game run · 🟡 on \`main\`, type-checked only (not yet built on Windows) · 🔵 already in the gta6 base, nothing to port · ⬜ not started · 🎮 needs the game on the owner's PC.
+>
+> **Windows record on the owner's PC (Ryzen 7 5800X, RTX 4070):** release build OK at \`903b9c1\`; \`cargo test -p victory-gpu --lib\` at \`8a3f99d\`: **253 passed, 0 failed, 7 ignored** (includes the placement, texture-digest, lean-dispatch 100,000-group and pipeline-library tests); \`cargo test -p victory-shader --lib\` on the shader-licm stack: **265 passed, 0 failed** (GPU parity and validation tests on the 4070). \`2364a29\` (streaming buffers, worker switches) is not yet built on Windows. **No in-game run yet: the owner does not have the game data.** No FPS, stability or picture claim exists for any item.
+
+| ID | State | Commits on \`main\` | What exists | Still needed for the gate |
+|---|---|---|---|---|
+| R03 | ✅ | \`9ead592\` | Every experiment branch is an ancestor of \`main\`; \`main\` = fxceless gta6 base + all Claude changes + this checklist. Upstream-based \`fc093e2\` deliberately not carried (gta6 has its own \`probe_view_limit\`). | — |
+| R04 | 🟢 🎮 | \`16183bd\` | \`shadow::exact\`: lookups/inserts only under EXACT, buffers made and copies dropped outside it, pruning every 64 askings (\`VICTORY_EXACT_EVERY\`). Belobug #451's pool **not** ported. | Lock-wait and frame A/B in game. |
+| R05 | 🟢 🎮 | \`dc744db\` | \`shadow::loose\`: RwLock, windows made outside the write lock, first insert wins. | As R04. |
+| R06 | 🟢 🎮 | \`f41357b\` | \`VICTORY_SPREAD_LEAN\` on by default on NVIDIA (vendor 0x10de), off elsewhere; \`0\`/\`1\`/\`alt\`. Indirect tests incl. 100,000 groups passed on the 4070. | In-game 0 vs 1 A/B. |
+| R07 | 🟢 🎮 | \`63b87e8\` | Texture change checks with 128-bit xxh3 (\`VICTORY_TEXTURE_DIGEST=blake3\` = old); log splits MB hashed / unchanged / changed. #916's remap-epoch fix not needed here (no epoch cache; map notices after \`MapViewOfFile3\` under the guards' lock). | In-game hash-cost A/B. |
+| R08 | ⬜ 🎮 | — | Partial detile not present. GPU detiler exists in the base, off (\`VICTORY_GPU_DETILE=1\`/\`alt\`). | Counters from R07 first. |
+| R09 | 🟢 🎮 | \`9a34b3f\`, \`e359d5e\`, \`456e911\`, \`8d9a337\` | DirectStorage before-write notice for page destinations (#2503) and card-word merges, both on by default (\`VICTORY_PAGE_WRITES_BEFORE=0\`, \`VICTORY_MERGE_WORDS=0\` to disable). | Deterministic storage-write tests; in-game. |
+| R10 | 🔵 🎮 | — | gta6 base probes the host heap limit and clamps view indices to its null slot; 2^18 dynamic slots. | Long-run: no exhaustion/dropped views. |
+| R11 | 🟢 🎮 | \`2293f30\`, \`5927925\` | klbf-lab #41 DXIL passes (LICM 256, barriers 512). | In-game captures, water/skin checks. |
+| R12 | ⬜ 🎮 | — | — | Needs the title's shaders. |
+| R13 | 🟡 partial | \`456e911\` | Merge-words writes back only words the card changed (neighbouring title writes survive); same-word CPU/GPU ordering still open; #451 not ported. | Race tests; R13 design. |
+| R14 | ⬜ | — | Static EXE call sites of XboxBvhBuilder recorded in earlier handoffs only. | — |
+| R15 | 🔵 partial | — | 64 KiB CBV cap at every \`CreateConstantBufferView\`; occlusion queries present, off (\`VICTORY_OCCLUSION\`). Scoped barriers (R22) not started. | — |
+| R16 | ⬜ 🎮 | — | DRED full/light/faults and per-second removal rows exist in the base. | 30–60+ min runs. |
+| R17 | ⬜ 🎮 | — | — | — |
+| R18 / R19 | 🟡 research | — | Static analysis only (five-pool initializer RVA 0x1E86440, flags 0x1004/0x1404/0x8404/0x2404/0x2004). | Runtime correlation. |
+| R20 | 🟡 🎮 | \`cf4a43b\` | Levels-on-demand view slots remade only before a submission with nothing in the air, for every view heap (\`VICTORY_VIEWS_REMADE_QUIET=0\` old, \`=1\` old quiet); longest wait logged. **Not built on Windows in isolation, but included in the \`8a3f99d\` test run.** | Long runs, 0 vs default, with DRED. |
+| R21 | ⬜ 🎮 | — | \`VICTORY_RETIRE_LEAN\` / \`VICTORY_REAPER\` exist in the base, off. | Measure first. |
+| R23 | 🟢 🎮 | \`995524a\` | Observe-only placement look every 30 s (\`VICTORY_PLACEMENT_LOOK=0\` off): per placement copies/bytes/asks/refreshed/written back, asks × rewrite-share grid, budget line, hot-and-stable PC copies and whether they would fit. Plus title PAGE_GRAPHICS census and costs (\`b87c2cc\`, \`79e2622\`, \`259dc72\`). | One in-game run of the lines. |
+| R24 | 🟡 partial | \`b87c2cc\`, \`79e2622\` | Flags recorded (placeholder splits too); GPU writes against read-only flags counted and warned. \`VirtualFree\` blind spot remains. | Write-against count = 0 in game; alias/generation work. |
+| R25–R27 | ⬜ | — | No placement changes; by design until R23 data exists. | — |
+| R28 | 🟢 partial | \`8a3f99d\`, \`903b9c1\` | (A) one save at a time from serialise to rename, workers skip rather than wait; (B) \`added\` reduced only after the file is in place, by this save's count; (C) early list re-marked changed when a save fails; (D) 20 s retry kept on purpose. Library tests passed on Windows. | Fault-injection tests not written. |
+| R29 | ⬜ | — | — | After R28 tests. |
+| R30 | 🟡 | \`2364a29\` | Experiment B: per-worker kept buffers (source, zlib out, BCPack symbols, bounce; \`VICTORY_DSTORAGE_SCRATCH_MB\`, 16; 0 = fresh); \`bcpack::decode_into\`; byte-identical test. Decoder measured on a 2.1 GHz VM: ~57 MB/s BC4, ~160 instructions per symbol in the lane loop. Decoder rewrite (C) in progress, to be checked byte-for-byte against the current one. | Windows build; in-game streaming numbers. |
+| R31 | 🟡 | \`2364a29\` | \`VICTORY_DSTORAGE_WORKERS\` (default 16 on the 5800X) and \`VICTORY_PIPELINE_WORKERS\` (default 12), 1–64, both counts logged. Defaults unchanged. | WPR/WPA ready-time profile, then the [storage, pipeline] matrix. |
+| R32 | ⬜ owner | — | Startup log already says "GPU upload heaps supported=…". | Owner's manifest. |
+| R33 | ⬜ 🎮 | — | \`victory translate --warm all <shader dir>\` exists (shader cache only); pack-aware PSO prebuild not ported. | Cold vs warm run. |
+| R34 | ⬜ 🎮 | — | — | PresentMon run. |
+| R35 | ⬜ | — | Note: \`PROCESS_MEMORY_COUNTERS.PagefileUsage\` is the process **commit charge** (Microsoft: "the total amount of private memory … committed"), so the existing "process … MB private" line is private commit, correctly named; working set and private working set are what is missing. | Add WS/private WS/commit limit/faults; baseline. |
+| R36–R40 | ⬜ | — | — | After R35. |
+
 ## CURRENT MAIN-BRANCH STATUS — 2026-11-27 07:46 UTC (supersedes earlier branch caveats)
 
 **Verified at [\`9ead5921c64\`](https://github.com/Zaxix/VIctory/commit/9ead5921c649c61d512f3f57503cc0066fc1afaa):** Claude integrated the fxceless GTA6 base and accumulated Zaxix experimental changes onto \`main\`, explicitly retaining the research checklist. The earlier statements below saying that \`main\` contains only \`fc093e2\` or that all optimisation experiments remain branch-only are **historical**, not the current state. Do not cherry-pick experimental branch commits as if missing. The old upstream-specific \`fc093e2\` heap-cap implementation was *not* transplanted unchanged: the GTA6 base handles the cap via its own \`probe_view_limit\` path. Inspect code before attributing a specific commit's diff to this version.
@@ -74,7 +115,7 @@
 
 - [ ] **R01 — Capture the RTX 4070 / 5800X baseline on the actual branch to be tested.** Record current SHA, NVIDIA driver, Windows version, firmware/Resizable BAR state (observed, not assumed), Series X vs S mode, game build, resolution, and shader-cache warmth. Measure at least three consistent runs. **Done when:** reproducible baseline frame-time table + settings + logs exist.
 - [ ] **R02 — Separate CPU time from GPU and synchronization time.** Trace per-frame command preparation, list worker waits, texture hashing, detiling, actual upload, copy-back, fence waits, and draw/dispatch work. `VICTORY_GPU_TIMING=1` and GPU-based validation alter timing and must *not* be treated as normal release FPS measurements. **Done when:** critical-path timeline identifies the top two measured costs. Source: [README debugging flags](../README.md).
-- [ ] **R03 — Compare main with each experiment branch by commit ancestry / scoped diff.** Record which experimental fixes are absent from main, which overlap, and which have been superseded. **Done when:** a branch-by-branch table shows `SHA → files → tests → result → target status`. Do not assume a merged upstream fix is absent until source checked.
+- [x] **R03 — Compare main with each experiment branch by commit ancestry / scoped diff.** *(Done 2026-11-27, Claude: every experiment branch is an ancestor of `main` at `9ead592`; see the implementation status table at the top.)* Record which experimental fixes are absent from main, which overlap, and which have been superseded. **Done when:** a branch-by-branch table shows `SHA → files → tests → result → target status`. Do not assume a merged upstream fix is absent until source checked.
 
 ## P1 — CPU-side submission, resource creation and locks
 
