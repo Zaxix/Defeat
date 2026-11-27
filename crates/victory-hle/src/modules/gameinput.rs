@@ -1,5 +1,6 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3); while none is connected, the keyboard drives one
+//! (host slots 0-3), and PlayStation pads read as HID devices fill the slots
+//! XInput leaves empty (`sony`); while none is connected, the keyboard drives one
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
@@ -16,6 +17,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
+
+mod sony;
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
@@ -1130,20 +1133,36 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// Slots XInput answered for last time it was asked.
+        xinput: [bool; PADS],
+    }
+
+    impl Host {
+        /// A slot XInput leaves empty: the next PlayStation pad, if any
+        /// ([`super::sony`]), counting the empty slots before it.
+        fn sony(&mut self, slot: usize) -> Option<PadState> {
+            self.xinput[slot] = false;
+            if !super::sony::on() {
+                return None;
+            }
+            let n = self.xinput[..slot].iter().filter(|&&x| !x).count();
+            super::sony::pad(n)
+        }
     }
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
-                return None;
+                return self.sony(slot);
             }
             let mut state = XINPUT_STATE::default();
             // SAFETY: room for the state.
             if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
-                return None;
+                return self.sony(slot);
             }
             self.empty_until[slot] = None;
+            self.xinput[slot] = true;
             #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
             // The scripted keys (`VICTORY_KEYS`) also press the first
