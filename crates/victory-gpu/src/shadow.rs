@@ -2787,7 +2787,7 @@ fn changed_runs_wide(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 
 #[cfg(test)]
 mod merge_tests {
-    use super::{PIECE, back_piece, changed_chunks, changed_runs, changed_runs_bytes, changed_runs_wide};
+    use super::{PIECE, back_piece, changed_chunks, changed_runs, changed_runs_bytes, changed_runs_wide, merge_piece, word_runs};
 
     #[test]
     fn changed_chunks_hold_every_changed_byte() {
