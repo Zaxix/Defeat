@@ -27,7 +27,8 @@ research checklist means what it says.
 > most 10 s in all for new compute pipelines, so the title's hang watchdog does not fire
 > (`VICTORY_PIPELINE_COMPUTE_WAIT_MS`); compute pipelines no earlier run used are made in the background
 > on 2 workers from their creation (`VICTORY_PIPELINE_COMPUTE_EARLY`, a worker count, 0 off); the frame
-> line says why draws were dropped. Research notes: `docs/RESEARCH_CHECKLIST.md`. Results on that PC:
+> line says why draws were dropped. Texture refreshes no longer wait while the game remaps its memory
+> (`VICTORY_TEXTURE_NO_WAIT=0` waits, as before). Research notes: `docs/RESEARCH_CHECKLIST.md`. Results on that PC:
 > [below](#status-on-the-owners-pc-ryzen-7-5800x--rtx-4070).
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
@@ -73,14 +74,15 @@ status table).
 | 4 | First story cutscene, with sound; very dark | 0.1–1.8 fps | Caches work (1,509 shader hits, 1,698 pipelines from the library); two frames waited 13.6 and 14.6 s for four compute pipelines; card at 10.2–11.9 GB of a ~10.4 GB budget | Compute pipelines started at creation (overdone, see run 5); a true 10 s limit; drop reasons logged |
 | 5 | Further into the cutscene; people visible, faces black | 0.1–2 fps in the world | Dropped draws are now ~all the switched-off ray-tracing builder's; compute-at-creation queued ~2,900 pipelines on all 12 workers, CPU 99 % for the whole run, and everything CPU-side (copy-back 260–1,000 ms, texture refreshes up to 1.7 s waiting on title remaps, the heap pass) slowed with it; 12 compute pipelines refused by the driver, 5 compute shaders do not translate | Spare compute pipelines on at most 2 workers, last; a refused pipeline logs the wave size it asks for |
 | 6 | The cutscene and its credits | 0.1–2.8 fps in the world | The CPU no longer pinned (about 6 of 16 processors); all 12 refused pipelines ask for 64-lane waves, which the RTX 4070 does not run; the largest cost a frame is texture refreshes waiting for the game to finish remapping memory (0.4–2.3 s); the card's memory just over its budget | Compute waits on several threads at once share one deadline (two frames had gone 3 s past the limit) |
+| 7 | Further into the cutscene; faces, skin and hair drawn | median 1.5 fps, up to 7.4 fps in the world | With `VICTORY_TEXTURE_NO_WAIT=1`: the remap wait gone (it was up to 8 s a frame); frames with over 300 draws 689 ms median against 2,245 ms in run 6, slowest 2.4 s against 13 s; no texture ever had to be left for a later frame; no frame reached the compute-wait limit. Now the largest costs: the thread that copies the card's results back (330–1,150 ms a frame, mostly its own work) and the heap pass (up to 900 ms) | Texture refreshes no longer wait for remapping, by default |
 
 **Why the picture is dark:** the game lights much of its scene with ray tracing (bounce light, lamp
 and sun shadows). With the builder off nothing is traced, so whatever direct light does not reach is
 black (the gta6 base sees the same on its PC, below). Texture slots also wait for room on a full card
-(about 20,000 in run 5; run 295 of the base found the same). Black faces may be one of these or the
-skin pass; not known yet.
+(about 20,000 in run 5; run 295 of the base found the same). The black faces of runs 5 and 6 were textures held back by the
+remap wait: drawn in run 7.
 
-**What limits the frame rate now:** waits on the CPU side, mostly for the game's memory remapping while it streams textures (run 6). The card itself is busy only a small part of each frame.
+**What limits the frame rate now:** CPU-side work after the remap wait was removed (run 7): copying the card's results back into the game's memory, and the pass over the game's descriptor heap. The card itself is busy only part of each frame.
 
 ## Status of the gta6 base on its tester's PC (fxceless; inherited, 2026-11-27, 03:45 UTC)
 

@@ -510,8 +510,17 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 }
 
 /// Whether a texture refresh that finds the runtime remapping title memory
-/// goes on without waiting for it (`VICTORY_TEXTURE_NO_WAIT=1`; off by
-/// default).
+/// goes on without waiting for it (on by default; `VICTORY_TEXTURE_NO_WAIT=0`
+/// waits, as before).
+///
+/// On by default since run 7 on the owner's PC (RTX 4070, 5800X): in run 6
+/// the wait was the largest cost of the frame, 365-2,290 ms a frame
+/// (8,095 of a frame's 8,103 ms of refreshes in the worst window); with
+/// the switch it was gone, the median frame of over 300 draws fell from
+/// 2,245 ms to 689 and the slowest from 13.0 s to 2.4 s, no refresh was
+/// left for the next one (0.0 a frame throughout), and the characters'
+/// faces and skin, black in runs 5 and 6, were drawn. The gta6 base's
+/// tester ran with it too.
 ///
 /// A texture whose memory is all mapped is read in place, under a lock
 /// the runtime takes alone while it changes a mapping
@@ -533,7 +542,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// is remapping may show a frame later. It never shows partly read.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
