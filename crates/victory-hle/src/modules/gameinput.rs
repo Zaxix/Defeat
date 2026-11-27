@@ -58,7 +58,7 @@ const KEYBOARD: usize = PADS + 1;
 const DEVICES: usize = PADS + 2;
 
 /// Readings kept per device for next/previous lookups.
-const HISTORY: usize = 32;
+const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
@@ -111,11 +111,6 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
-    /// Scripted diagnostic keys (`VICTORY_KEYS`), independent of focus.
-    #[cfg(any(test, feature = "diagnostics"))]
-    fn scripted_keys(&mut self) -> Vec<KeyState> {
-        Vec::new()
-    }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
@@ -139,33 +134,6 @@ fn fallback(keys: &[KeyState]) -> PadState {
         left_y: on(b'W') - on(b'S'),
         right_x: on(b'L') - on(b'J'),
         right_y: on(b'I') - on(b'K'),
-    }
-}
-
-/// Combines `extra` (from `VICTORY_KEYS`) onto `base` (a physical host pad).
-#[cfg(any(test, feature = "diagnostics"))]
-fn merge_pad(base: PadState, extra: PadState) -> PadState {
-    PadState {
-        buttons: base.buttons | extra.buttons,
-        left_trigger: base.left_trigger.max(extra.left_trigger),
-        right_trigger: base.right_trigger.max(extra.right_trigger),
-        left_x: (base.left_x + extra.left_x).clamp(-1.0, 1.0),
-        left_y: (base.left_y + extra.left_y).clamp(-1.0, 1.0),
-        right_x: (base.right_x + extra.right_x).clamp(-1.0, 1.0),
-        right_y: (base.right_y + extra.right_y).clamp(-1.0, 1.0),
-    }
-}
-
-/// Applies `scripted` keys to the first connected host pad, so `VICTORY_KEYS`
-/// works even when an XInput or virtual controller disables `FALLBACK`.
-#[cfg(any(test, feature = "diagnostics"))]
-fn merge_scripted(pads: &mut [Option<PadState>; PADS], scripted: &[KeyState]) {
-    if scripted.is_empty() {
-        return;
-    }
-    let extra = fallback(scripted);
-    if let Some(pad) = pads.iter_mut().flatten().next() {
-        *pad = merge_pad(*pad, extra);
     }
 }
 
@@ -352,8 +320,6 @@ struct Slot {
 
 struct State {
     slots: [Slot; DEVICES],
-    /// Host slots that have reported non-rest input on their current connection.
-    seen_input: [bool; PADS],
     callbacks: Vec<Registration>,
     /// Asynchronous enumerations, delivered by the next poll.
     pending: Vec<Event>,
@@ -400,7 +366,6 @@ impl Hub {
             source: Mutex::new(source),
             state: Mutex::new(State {
                 slots: Default::default(),
-                seen_input: [false; PADS],
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
@@ -436,16 +401,12 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys, scripted) = {
+        let (pads, keys) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            #[cfg(any(test, feature = "diagnostics"))]
-            let scripted = source.scripted_keys();
-            #[cfg(not(any(test, feature = "diagnostics")))]
-            let scripted: [KeyState; 0] = [];
-            (pads, source.keys(), scripted)
+            (pads, source.keys())
         };
-        let events = self.state().poll(&self.devices, pads, keys, &scripted);
+        let events = self.state().poll(&self.devices, pads, keys);
         self.deliver(events);
     }
 
@@ -490,38 +451,14 @@ impl State {
         devices: &[Device; DEVICES],
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
-        scripted: &[KeyState],
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
-        // A wireless receiver answers for a switched-off pad with an all-zero
-        // report; ignore a slot until its current connection reports input.
-        let mut pads: [Option<PadState>; PADS] = std::array::from_fn(|slot| {
-            let Some(pad) = pads[slot] else {
-                self.seen_input[slot] = false;
-                return None;
-            };
-            if pad != PadState::default() {
-                self.seen_input[slot] = true;
-            }
-            self.seen_input[slot].then_some(pad)
-        });
-        #[cfg(any(test, feature = "diagnostics"))]
-        merge_scripted(&mut pads, scripted);
-        #[cfg(not(any(test, feature = "diagnostics")))]
-        let _ = (&mut pads, scripted);
         let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| {
-            let base = fallback(&keys);
-            #[cfg(any(test, feature = "diagnostics"))]
-            if !scripted.is_empty() {
-                return Value::Pad(merge_pad(base, fallback(scripted)));
-            }
-            Value::Pad(base)
-        });
+        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -684,8 +621,7 @@ extern "system" fn current_reading(
     hand(out, found)
 }
 
-/// The reading after (`forward`) or before `reference`: on `device`, or with
-/// none given on any device, in time order (ties by device, then sequence).
+/// The reading after (`forward`) or before `reference` on its device.
 fn relative(
     this: This,
     reference: *const Reading,
@@ -700,6 +636,9 @@ fn relative(
     let hub = hub(this);
     // SAFETY: a reading we handed out and the title still holds.
     let reference = unsafe { &*reference };
+    // shortcut: with no device given only the reference's device is walked,
+    // not every device's readings in time order; the title walks
+    // only keyboard readings (one device) and the current pad's previous one.
     let Some(index) = hub.index(reference.device) else {
         return fail(out, E_INVALIDARG);
     };
@@ -707,38 +646,27 @@ fn relative(
         return fail(out, E_INVALIDARG);
     }
     let state = hub.state();
-    if state.slots[index]
-        .history
+    let history = &state.slots[index].history;
+    if history
         .front()
         .is_none_or(|oldest| reference.sequence < oldest.sequence)
     {
         return fail(out, REFERENCE_TOO_OLD);
     }
-    // On one device this order is its sequence order.
-    let at = (reference.timestamp, index, reference.sequence);
-    let devices = if device.is_null() {
-        0..DEVICES
-    } else {
-        index..index + 1
-    };
-    let candidates = devices
-        .flat_map(|i| {
-            let history = &state.slots[i].history;
-            history
-                .iter()
-                .map(move |r| ((r.timestamp, i, r.sequence), r))
-        })
-        .filter(|(_, r)| r.kind() & kind != 0);
+    let wanted = |r: &&Ref| r.kind() & kind != 0;
     let found = if forward {
-        candidates
-            .filter(|(key, _)| *key > at)
-            .min_by_key(|(key, _)| *key)
+        history
+            .iter()
+            .filter(|r| r.sequence > reference.sequence)
+            .find(wanted)
     } else {
-        candidates
-            .filter(|(key, _)| *key < at)
-            .max_by_key(|(key, _)| *key)
+        history
+            .iter()
+            .rev()
+            .filter(|r| r.sequence < reference.sequence)
+            .find(wanted)
     };
-    hand(out, found.map(|(_, r)| r))
+    hand(out, found)
 }
 extern "system" fn next_reading(
     this: This,
@@ -784,7 +712,7 @@ fn token(out: *mut u64) -> HRESULT {
     S_OK
 }
 
-// shortcut: reading callbacks never run; Grand Theft Auto VI registers none
+// shortcut: reading callbacks never run; the title registers none
 // (it polls).
 extern "system" fn register_reading(
     _: This,
@@ -983,7 +911,7 @@ extern "system" fn device_status(this: *const Device) -> u32 {
 // shortcut: trigger motors are dropped (XInput has none). The host API that
 // drives them without a redistributable is Windows.Gaming.Input (WinRT
 // `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
-// diagnostics builds; Grand Theft Auto VI sends trigger levels in slot 0x50.
+// diagnostics builds; the title sends trigger levels in slot 0x50.
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
@@ -1204,17 +1132,6 @@ mod host {
         empty_until: [Option<Instant>; PADS],
     }
 
-    fn key_state(vk: u8) -> KeyState {
-        KeyState {
-            // SAFETY: plain query.
-            scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
-            virtual_key: vk,
-            // shortcut: no characters (code point 0); Grand Theft
-            // Auto VI reads scan codes and virtual keys only.
-            ..Default::default()
-        }
-    }
-
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
@@ -1227,7 +1144,21 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
-            Some(convert(&state.Gamepad))
+            #[allow(unused_mut)]
+            let mut pad = convert(&state.Gamepad);
+            // The scripted keys (`VICTORY_KEYS`) also press the first
+            // pad's buttons, by the stand-in pad's table: with a real pad
+            // connected the stand-in is not there, and a title that listens
+            // to the pad (the title's start screen) saw nothing.
+            #[cfg(feature = "diagnostics")]
+            if slot == 0 {
+                for vk in scripted() {
+                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
+                        pad.buttons |= button;
+                    }
+                }
+            }
+            Some(pad)
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
@@ -1245,19 +1176,16 @@ mod host {
                     .collect();
                 down.extend(held);
             }
-            down.into_iter().map(key_state).collect()
-        }
-
-        #[cfg(any(test, feature = "diagnostics"))]
-        fn scripted_keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
-            {
-                scripted().into_iter().map(key_state).collect()
-            }
-            #[cfg(not(feature = "diagnostics"))]
-            {
-                Vec::new()
-            }
+            down.into_iter()
+                .map(|vk| KeyState {
+                    // SAFETY: plain query.
+                    scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
+                    virtual_key: vk,
+                    // shortcut: no characters (code point 0);
+                    // the title reads scan codes and virtual keys only.
+                    ..Default::default()
+                })
+                .collect()
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1356,7 +1284,6 @@ mod tests {
     struct FakeHost {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
-        scripted: Vec<KeyState>,
         rumble: Vec<(usize, u16, u16)>,
     }
 
@@ -1368,9 +1295,6 @@ mod tests {
         }
         fn keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
-        }
-        fn scripted_keys(&mut self) -> Vec<KeyState> {
-            self.0.lock().unwrap().scripted.clone()
         }
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             self.0.lock().unwrap().rumble.push((slot, low, high));
@@ -1564,57 +1488,6 @@ mod tests {
     }
 
     #[test]
-    fn with_no_device_readings_are_walked_across_devices_in_time_order() {
-        type Walk = extern "system" fn(This, *const Reading, u32, *const Device, Out) -> HRESULT;
-        let any = |hub: &Hub, offset, from, kind| {
-            let mut out = std::ptr::null();
-            let walk = slot::<Walk, _>(&hub.object, offset);
-            result(
-                walk(&hub.object, from, kind, std::ptr::null(), &mut out),
-                out,
-            )
-        };
-        let both = GAMEPAD_KIND | KEYBOARD_KIND;
-        let tick = || std::thread::sleep(Duration::from_millis(2));
-        let (hub, host) = fake();
-        // The first poll: the stand-in pad and the keyboard, at one time.
-        let stand_in = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
-        let no_keys = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
-        tick();
-        host.lock().unwrap().pads[1] = Some(PadState {
-            buttons: A,
-            ..Default::default()
-        });
-        hub.poll();
-        let pad_a = current(hub, GAMEPAD_KIND, 1).unwrap();
-        tick();
-        host.lock().unwrap().keys = vec![key(b'W')];
-        hub.poll();
-        let w = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
-        tick();
-        host.lock().unwrap().pads[1].as_mut().unwrap().buttons = B;
-        hub.poll();
-        let pad_b = current(hub, GAMEPAD_KIND, 1).unwrap();
-
-        let order = [stand_in, no_keys, pad_a, w, pad_b];
-        for pair in order.windows(2) {
-            assert_eq!(any(hub, 0x28, pair[0], both), Ok(pair[1]));
-            assert_eq!(any(hub, 0x30, pair[1], both), Ok(pair[0]));
-        }
-        assert_eq!(any(hub, 0x30, stand_in, both), Err(READING_NOT_FOUND));
-        assert_eq!(any(hub, 0x28, pad_b, both), Err(READING_NOT_FOUND));
-        // Only gamepads: the keyboard's readings are skipped.
-        assert_eq!(any(hub, 0x28, stand_in, GAMEPAD_KIND), Ok(pad_a));
-        assert_eq!(any(hub, 0x28, pad_a, GAMEPAD_KIND), Ok(pad_b));
-        assert_eq!(any(hub, 0x30, pad_a, GAMEPAD_KIND), Ok(stand_in));
-        // Naming the device keeps the walk on it.
-        assert_eq!(walk(hub, 0x30, pad_a), Err(READING_NOT_FOUND));
-        for r in order {
-            release(r);
-        }
-    }
-
-    #[test]
     fn keys_feed_the_keyboard_and_the_stand_in_pad() {
         let (hub, host) = fake();
         let log = Log::default();
@@ -1661,10 +1534,7 @@ mod tests {
 
         let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
         assert!(unregister(&hub.object, token, 5000));
-        host.lock().unwrap().pads[0] = Some(PadState {
-            buttons: A,
-            ..Default::default()
-        });
+        host.lock().unwrap().pads[0] = Some(PadState::default());
         hub.poll();
         assert_eq!(log.lock().unwrap().len(), 1);
     }
@@ -1711,10 +1581,7 @@ mod tests {
             register(&hub.object, std::ptr::null(), GAMEPAD_KIND, 1, 0, context, Some(slow), &mut token),
             S_OK
         );
-        host.lock().unwrap().pads[1] = Some(PadState {
-            buttons: A,
-            ..Default::default()
-        });
+        host.lock().unwrap().pads[1] = Some(PadState::default());
         let poller = std::thread::spawn(|| hub.poll());
         while !INSIDE.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(1));
@@ -1758,131 +1625,5 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
-    }
-
-    #[test]
-    fn scripted_keys_merge_into_connected_host_pad() {
-        let (hub, host) = fake();
-        let physical = PadState {
-            buttons: B,
-            left_x: -0.5,
-            ..Default::default()
-        };
-        {
-            let mut h = host.lock().unwrap();
-            h.pads[1] = Some(physical);
-            h.scripted = vec![key(0x0D), key(b'W'), key(b'C')];
-        }
-        hub.poll();
-
-        assert_eq!(current(hub, GAMEPAD_KIND, FALLBACK), Err(DEVICE_DISCONNECTED));
-        let r = current(hub, GAMEPAD_KIND, 1).unwrap();
-        assert_eq!(
-            pad(r),
-            PadState {
-                buttons: B | A,
-                left_x: -0.5,
-                left_y: 1.0,
-                right_trigger: 1.0,
-                ..Default::default()
-            }
-        );
-        release(r);
-
-        host.lock().unwrap().scripted.clear();
-        hub.poll();
-        let r = current(hub, GAMEPAD_KIND, 1).unwrap();
-        assert_eq!(pad(r), physical);
-        release(r);
-    }
-
-    #[test]
-    fn switched_off_receiver_does_not_hide_the_keyboard_stand_in() {
-        let (hub, host) = fake();
-        let log = Log::default();
-        register(hub, GAMEPAD_KIND, 2, &log);
-        assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED, 0)]);
-
-        // A receiver answering with an all-zero state while its pad is off
-        // stays disconnected and leaves the keyboard stand-in active.
-        host.lock().unwrap().pads[0] = Some(PadState::default());
-        hub.poll();
-        assert_eq!(log.lock().unwrap().len(), 1);
-        assert_eq!(current(hub, GAMEPAD_KIND, 0), Err(DEVICE_DISCONNECTED));
-
-        host.lock().unwrap().keys = vec![key(0x0D), key(b'W')];
-        hub.poll();
-        let stand_in = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
-        assert_eq!(
-            pad(stand_in),
-            PadState {
-                buttons: A,
-                left_y: 1.0,
-                ..Default::default()
-            }
-        );
-        release(stand_in);
-
-        // Scripted diagnostic keys drive the stand-in without latching the
-        // idle receiver slot as an active physical controller.
-        {
-            let mut h = host.lock().unwrap();
-            h.keys.clear();
-            h.scripted = vec![key(b'X')];
-        }
-        hub.poll();
-        assert_eq!(current(hub, GAMEPAD_KIND, 0), Err(DEVICE_DISCONNECTED));
-        let scripted_r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
-        assert_eq!(pad(scripted_r).buttons, X);
-        release(scripted_r);
-
-        host.lock().unwrap().scripted.clear();
-        hub.poll();
-        let rest = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
-        assert_eq!(pad(rest), PadState::default());
-        release(rest);
-
-        // Turning the pad on and pressing a button connects slot 0, drops the
-        // stand-in, and preserves that first press as the current reading.
-        host.lock().unwrap().pads[0] = Some(PadState {
-            buttons: B,
-            ..Default::default()
-        });
-        hub.poll();
-        assert_eq!(
-            log.lock().unwrap()[1..],
-            [(0, STATUS_CONNECTED, 0), (FALLBACK, 0, STATUS_CONNECTED)]
-        );
-        assert_eq!(
-            current(hub, GAMEPAD_KIND, FALLBACK),
-            Err(DEVICE_DISCONNECTED)
-        );
-        let first = current(hub, GAMEPAD_KIND, 0).unwrap();
-        assert_eq!(pad(first).buttons, B);
-        release(first);
-
-        // Releasing the button back to rest keeps slot 0 connected.
-        host.lock().unwrap().pads[0] = Some(PadState::default());
-        hub.poll();
-        let idle = current(hub, GAMEPAD_KIND, 0).unwrap();
-        assert_eq!(pad(idle), PadState::default());
-        release(idle);
-
-        // Unplugging clears `seen_input` so a later neutral receiver on the
-        // same slot does not take the stand-in away again.
-        host.lock().unwrap().pads[0] = None;
-        hub.poll();
-        assert_eq!(current(hub, GAMEPAD_KIND, 0), Err(DEVICE_DISCONNECTED));
-
-        {
-            let mut h = host.lock().unwrap();
-            h.pads[0] = Some(PadState::default());
-            h.keys = vec![key(0x0D)];
-        }
-        hub.poll();
-        assert_eq!(current(hub, GAMEPAD_KIND, 0), Err(DEVICE_DISCONNECTED));
-        let back = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
-        assert_eq!(pad(back).buttons, A);
-        release(back);
     }
 }
