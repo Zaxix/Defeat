@@ -177,17 +177,44 @@ pub fn group_sync() -> u8 {
 /// - `0`: none (the module as the lowering made it).
 /// - a number (decimal or `0x` hex): those passes; 1 dead code, 2 constants
 ///   and identities, 4 one instruction for one value, 8 what a branch taken
-///   says about its condition, 16 one read for one place within a block,
-///   32 a first-lane read of two host waves without the round that asks
-///   which half has a lane (where every lane has one).
-///   64 the dwords of one console load read by one call for every four
-///   (not on unless asked: `127` is every pass with it).
+///   says about its condition, 16 one read for one place within a block and
+///   non-aliasing local/shared forwarding, 32 a first-lane read of two host
+///   waves without the round that asks which half has a lane (where every lane
+///   has one), 64 the dwords of one console load read by one call for every
+///   four, 128 the fast-math flag, 256 pure loop-invariant code motion, 512
+///   adjacent and read-after-read redundant barrier elimination (256 and 512
+///   from PastiiJay/klbf-lab#41, where they were 64 and 128). `895` is every
+///   pass without the fast-math flag, `1023` every pass with it.
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn shader_opt() -> u32 {
+    #[cfg(test)]
+    if let Some(passes) = TEST_SHADER_OPT.with(std::cell::Cell::get) {
+        return passes & bitcode::opt::ALL;
+    }
     static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SHADER_OPT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with `shader_opt()` overridden to `passes` on the current thread
+/// (tests only; restores the previous override on unwind).
+#[cfg(test)]
+pub(crate) fn with_shader_opt<R>(passes: u32, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<u32>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_SHADER_OPT.with(|c| c.set(self.0));
+        }
+    }
+    let prev = TEST_SHADER_OPT.with(|c| c.replace(Some(passes)));
+    let _guard = Reset(prev);
+    f()
 }
 
 /// Everything a translation depends on besides the container: the
@@ -1061,15 +1088,16 @@ mod tests {
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
         let (all, usual) = (super::bitcode::opt::ALL, super::bitcode::opt::DEFAULT);
-        assert_eq!(usual, 127 | super::bitcode::opt::FAST, "every pass, the wide loads and the fast-math flag too");
+        assert_eq!(usual, 895 | super::bitcode::opt::FAST, "every pass, the wide loads and the fast-math flag too");
         assert_eq!(parse_shader_opt(None), usual);
         assert_eq!(parse_shader_opt(Some("0")), 0);
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
-        assert_eq!(parse_shader_opt(Some("127")), all);
+        assert_eq!(parse_shader_opt(Some("895")), all);
+        assert_eq!(parse_shader_opt(Some("127")), 127, "the passes of before klbf-lab#41's two");
         let fast = super::bitcode::opt::FAST;
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all | fast);
-        assert_eq!(parse_shader_opt(Some("255")), all | fast);
+        assert_eq!(parse_shader_opt(Some("1023")), all | fast);
         assert_eq!(parse_shader_opt(Some("on")), usual);
     }
 
