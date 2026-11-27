@@ -109,6 +109,9 @@ fn virtual_alloc(
     protect: u32,
     on_commit: impl FnOnce(usize, usize),
 ) -> *mut c_void {
+    // The title's own protection, GPU bits included, before it is cleaned
+    // for the host (`victory_gpu::gpu_access`).
+    let console_protect = protect;
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
@@ -179,6 +182,12 @@ fn virtual_alloc(
             at = format_args!("{at:p}"),
             "XMemVirtualAlloc"
         );
+    }
+    // What the title says the GPU may do there, recorded as it gave it
+    // (a census only so far; nothing skips work by it).
+    if !at.is_null() {
+        let start = if base.is_null() { at } else { base };
+        victory_gpu::title_memory_gpu_access(start as usize, size, console_protect);
     }
     // Memory committed for the title: the GPU side's notes that blocks there
     // are uncommitted go (`VICTORY_ABSENT_ONCE`).

@@ -55,6 +55,7 @@ mod heap_worker;
 mod host;
 #[cfg(windows)]
 mod indirect;
+pub mod gpu_access;
 #[cfg(windows)]
 mod inplace;
 mod launch;
@@ -93,6 +94,7 @@ mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
+pub use gpu_access::{note_gpu_write, title_memory_gpu_access};
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
