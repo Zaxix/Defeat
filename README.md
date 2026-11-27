@@ -11,7 +11,10 @@
 > (`VICTORY_SPREAD_LEAN=0`); levels-on-demand view slots made again only with
 > nothing on the card (`VICTORY_VIEWS_REMADE_QUIET=0` or `1`). Counted only:
 > the title's `PAGE_GRAPHICS_*` flags and the GPU work by them
-> (`VICTORY_GPU_ACCESS_COSTS=0`). Research notes: `docs/RESEARCH_CHECKLIST.md`.
+> (`VICTORY_GPU_ACCESS_COSTS=0`), and where host copies live (PC memory,
+> card memory, GPU upload heap, in place) with what each placement costs,
+> every 30 s (`VICTORY_PLACEMENT_LOOK=0`; the observing half of adaptive
+> placement: nothing moves). Research notes: `docs/RESEARCH_CHECKLIST.md`.
 > None of it has been run in the game on that PC yet.
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a

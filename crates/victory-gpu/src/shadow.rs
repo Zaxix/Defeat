@@ -80,6 +80,10 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Since the placement look last took them (`crate::placement`): lists
+    /// that asked for the copy, bytes brought up to date in it, bytes of
+    /// GPU writes in it that went back to title memory.
+    look: [AtomicU64; 3],
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -285,6 +289,47 @@ pub(crate) fn card_room_kept() -> u64 {
 
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+/// Copies lists asked for since the last placement look, each noted at its
+/// first ask (`Shadow::looked_at`).
+static ASKED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+/// For `crate::placement`: the copies asked for since the last call, each
+/// with what it was asked and did (its counts taken), and the copies in
+/// the card's memory no list asked for meanwhile (copies and bytes).
+pub(crate) fn placement_look() -> (Vec<crate::placement::Seen>, (u64, u64)) {
+    let asked = std::mem::take(&mut *ASKED.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut ids = std::collections::HashSet::with_capacity(asked.len());
+    let mut seen = Vec::with_capacity(asked.len());
+    for shadow in asked.iter().filter_map(std::sync::Weak::upgrade) {
+        if !ids.insert(shadow.id) {
+            continue;
+        }
+        let [asks, refreshed, written_back] = [0, 1, 2].map(|i| shadow.look[i].swap(0, Ordering::Relaxed));
+        seen.push(crate::placement::Seen {
+            placement: shadow.placement(),
+            window: shadow.window,
+            len: shadow.len,
+            asks,
+            refreshed,
+            written_back,
+        });
+    }
+    let cold = CARDED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .filter(|shadow| !ids.contains(&shadow.id))
+        .fold((0, 0), |(n, bytes), shadow| (n + 1, bytes + shadow.len));
+    (seen, cold)
+}
+
+/// Bytes alive of copies' card sides and of their "before" twins
+/// (`crate::placement`).
+pub(crate) fn card_bytes() -> [u64; 2] {
+    [0, 1].map(|i| CARD_BYTES[i].load(Ordering::Relaxed))
+}
 
 /// The copies in the card's memory whose CPU side changed since
 /// [`card_dirty`] last took their ranges: each is put here when its list of
@@ -1307,17 +1352,21 @@ fn merge_words_on() -> bool {
 /// Writes a merge's result `merged` over title memory at `address`: the
 /// whole stretch, or with [`merge_words_on`] (and `read`, the stretch as
 /// the merge read it) only the runs of words where they differ.
-fn write_merged(address: usize, read: Option<&[u8]>, merged: &[u8]) {
+fn write_merged(address: usize, read: Option<&[u8]>, merged: &[u8]) -> usize {
     match read {
         Some(read) if merge_words_on() => {
+            let mut written = 0;
             word_runs(address, read, merged, |off, len| {
                 crate::host::write_mapped((address + off) as *mut u8, merged[off..].as_ptr(), len);
                 crate::gpu_access::note_gpu_write(address + off, len);
+                written += len;
             });
+            written
         }
         _ => {
             crate::host::write_mapped(address as *mut u8, merged.as_ptr(), merged.len());
             crate::gpu_access::note_gpu_write(address, merged.len());
+            merged.len()
         }
     }
 }
@@ -3404,7 +3453,38 @@ impl Shadow {
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         let len = len.min(self.start + self.len - address);
         crate::gpu_access::count(crate::gpu_access::Cost::Refreshed, address as usize, len as usize);
+        self.looked_at();
         list.defer_refresh(self, address as usize, len as usize);
+    }
+
+    /// A list asks for the copy (`crate::placement`): counted, and the copy
+    /// noted for the next look the first time since the last one.
+    fn looked_at(self: &Arc<Self>) {
+        if crate::placement::on() && self.look[0].fetch_add(1, Ordering::Relaxed) == 0 {
+            ASKED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(self));
+        }
+    }
+
+    /// `bytes` of GPU writes in the copy went back to title memory
+    /// (`crate::placement`).
+    fn wrote_back(&self, bytes: usize) {
+        if bytes != 0 && crate::placement::on() {
+            self.look[2].fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Where the copy is (`crate::placement`).
+    fn placement(&self) -> crate::placement::Placement {
+        use crate::placement::Placement;
+        if self.place.is_some() {
+            Placement::InPlace
+        } else if self.card.is_some() {
+            Placement::Card
+        } else if self.uploaded != 0 {
+            Placement::Upload
+        } else {
+            Placement::Pc
+        }
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
@@ -3434,6 +3514,7 @@ impl Shadow {
             window: false,
             uploaded: 0,
             place: None,
+            look: [const { AtomicU64::new(0) }; 3],
         }
     }
 
@@ -3664,6 +3745,7 @@ impl Shadow {
                 for &(off, len) in &runs {
                     crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
                     crate::gpu_access::note_gpu_write(start + at + off, len);
+                    self.wrote_back(len);
                     written += len;
                 }
             }
@@ -3768,7 +3850,7 @@ impl Shadow {
         }
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "pc relay");
-        write_merged(start + at, as_read.as_deref(), &title[..]);
+        self.wrote_back(write_merged(start + at, as_read.as_deref(), &title[..]));
         #[cfg(feature = "diagnostics")]
         crate::backreads::stored(self.id, (self.start, self.len), start + at, n, false);
         n
@@ -4201,6 +4283,15 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        let bytes = self.update_asked(address, len);
+        if bytes != 0 && crate::placement::on() {
+            self.look[1].fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+        bytes
+    }
+
+    /// [`Shadow::update`] itself.
+    fn update_asked(&self, address: usize, len: usize) -> usize {
         // In place: the card reads title memory itself.
         if self.place.is_some() {
             return 0;
@@ -4735,7 +4826,7 @@ impl Shadow {
                 crate::host::shaders_write(start + at, &title[..]);
                 crate::watch::writing(start + at, n);
                 merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
-                write_merged(start + at, as_read.as_deref(), &title[..]);
+                self.wrote_back(write_merged(start + at, as_read.as_deref(), &title[..]));
                 written = n;
             }
         } else {
@@ -4828,7 +4919,7 @@ impl Shadow {
         }
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
-        write_merged(start + at, as_read.as_deref(), &title[..]);
+        self.wrote_back(write_merged(start + at, as_read.as_deref(), &title[..]));
         #[cfg(feature = "diagnostics")]
         crate::backreads::stored(self.id, (self.start, self.len), start + at, n, false);
         n
