@@ -7,7 +7,7 @@
 > **Snapshot (2026-11-27):** default branch `main` at `fc093e2ca81095d9c090fdfe99b79353030c5984`. Experimental branches include `exact-lock`, `loose-lock`, `shader-licm`, `texture-digest`, `gpu-access-costs`, `gpu-access-flags`, `merge-words`, `dstorage-before-write`, and `gta6`. Branches **diverge** from main; a commit's presence on an experiment branch does **not** mean it is deployed on main. Re-check ancestry and latest head before each investigation.
 
 
-## IMPLEMENTATION STATUS — Claude-owned (updated 2026-11-27 08:25 UTC; code on \`main\` up to \`2364a29\`)
+## IMPLEMENTATION STATUS — Claude-owned (updated 2026-11-27 08:45 UTC)
 
 > **Single source of truth for what is built.** Research text below is unchanged; this table says what of it exists in code on \`main\`, what was tested where, and what each item's gate still needs. Claude keeps this section current; research edits elsewhere are welcome. A box below is ticked only when its own "Done when" gate is met: most gates need the game running on the owner's PC, so most items stay open even when their code is merged.
 >
@@ -40,12 +40,12 @@
 | R25–R27 | ⬜ | — | No placement changes; by design until R23 data exists. | — |
 | R28 | 🟢 partial | \`8a3f99d\`, \`903b9c1\` | (A) one save at a time from serialise to rename, workers skip rather than wait; (B) \`added\` reduced only after the file is in place, by this save's count; (C) early list re-marked changed when a save fails; (D) 20 s retry kept on purpose. Library tests passed on Windows. | Fault-injection tests not written. |
 | R29 | ⬜ | — | — | After R28 tests. |
-| R30 | 🟡 | \`2364a29\` | Experiment B: per-worker kept buffers (source, zlib out, BCPack symbols, bounce; \`VICTORY_DSTORAGE_SCRATCH_MB\`, 16; 0 = fresh); \`bcpack::decode_into\`; byte-identical test. Decoder measured on a 2.1 GHz VM: ~57 MB/s BC4, ~160 instructions per symbol in the lane loop. Decoder rewrite (C) in progress, to be checked byte-for-byte against the current one. | Windows build; in-game streaming numbers. |
+| R30 | 🟡 | \`2364a29\` | Experiment B: per-worker kept buffers (source, zlib out, BCPack symbols, bounce; \`VICTORY_DSTORAGE_SCRATCH_MB\`, 16; 0 = fresh); \`bcpack::decode_into\`; byte-identical test. **Decoder rewrite (C) tried and dropped (2026-11-27):** a differential harness (frozen copy of the old lane decoder vs the new on valid, damaged and noise streams, real and test tables; it caught two planted bugs) showed (1) skipping parked lanes and (2) hoisting table rows give 174 → 186 and 174 → 175 instructions a symbol by callgrind: no gain. Of ~174 instructions a symbol, ~70 are the step itself and ~100 the round bookkeeping that keeps the console's byte order. On a 2.1 GHz VM the decoder already runs ~57 MB/s (BC4), about 5x the 12 MB/s a worker of run 327: the in-game rate is more likely contention (R31) or waits than decode instructions. | Windows build; in-game streaming numbers with R31's worker counts. |
 | R31 | 🟡 | \`2364a29\` | \`VICTORY_DSTORAGE_WORKERS\` (default 16 on the 5800X) and \`VICTORY_PIPELINE_WORKERS\` (default 12), 1–64, both counts logged. Defaults unchanged. | WPR/WPA ready-time profile, then the [storage, pipeline] matrix. |
 | R32 | ⬜ owner | — | Startup log already says "GPU upload heaps supported=…". | Owner's manifest. |
 | R33 | ⬜ 🎮 | — | \`victory translate --warm all <shader dir>\` exists (shader cache only); pack-aware PSO prebuild not ported. | Cold vs warm run. |
 | R34 | ⬜ 🎮 | — | — | PresentMon run. |
-| R35 | ⬜ | — | Note: \`PROCESS_MEMORY_COUNTERS.PagefileUsage\` is the process **commit charge** (Microsoft: "the total amount of private memory … committed"), so the existing "process … MB private" line is private commit, correctly named; working set and private working set are what is missing. | Add WS/private WS/commit limit/faults; baseline. |
+| R35 | 🟡 partial | (this merge) | A line once a minute from \`PROCESS_MEMORY_COUNTERS_EX2\`: private commit + peak, working set + peak, private working set, page faults since the last line (soft and hard), system commit vs limit and peak; fallback without EX2. Note: \`PagefileUsage\` is the process **commit charge** (Microsoft: "the total amount of private memory … committed"), so the existing "process … MB private" is private commit, correctly named. | Per-category ledger (shadows, staging, pools); in-game baseline per phase. |
 | R36–R40 | ⬜ | — | — | After R35. |
 
 ## CURRENT MAIN-BRANCH STATUS — 2026-11-27 07:46 UTC (supersedes earlier branch caveats)
