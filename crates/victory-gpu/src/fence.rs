@@ -35,6 +35,42 @@ struct Fence {
     asked: Mutex<Vec<pace::Asked>>,
 }
 
+/// Events the title waits on that their fence has not reached: the fence,
+/// the value, and when the wait was asked for (milliseconds since the
+/// first). For a stall of the title's main thread ([`waits_note`]): a wait
+/// that never ends shows here. At most [`WAITING_MOST`] kept.
+static WAITING: Mutex<Vec<(usize, u64, u64)>> = Mutex::new(Vec::new());
+const WAITING_MOST: usize = 256;
+
+fn now_ms() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// The oldest waits on fences not reached yet, for a line about a stall.
+pub fn waits_note() -> String {
+    let now = now_ms();
+    // Held while the fences are read: one released meanwhile leaves the
+    // list under it ([`release`]).
+    let held = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut waiting = held.clone();
+    waiting.sort_by_key(|w| w.2);
+    if waiting.is_empty() {
+        return "no fence wait of the title's outstanding".to_owned();
+    }
+    let oldest: Vec<String> = waiting
+        .iter()
+        .take(6)
+        .map(|&(f, value, at)| {
+            // SAFETY: a fence in the list is alive: its last release takes
+            // it out under the lock held here.
+            let reached = unsafe { &*(f as *const Fence) }.value.load(Ordering::Acquire);
+            format!("fence {f:#x} at {reached} awaited at {value} for {:.1} s", now.saturating_sub(at) as f64 / 1000.0)
+        })
+        .collect();
+    format!("{} fence waits of the title outstanding, oldest: {}", waiting.len(), oldest.join(", "))
+}
+
 fn fence<'a>(this: This) -> &'a Fence {
     // SAFETY: called from fence methods only.
     unsafe { &*this.cast::<Fence>() }
@@ -78,7 +114,13 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
     )
 }
 extern "system" fn release(this: This) -> u32 {
-    object::release_boxed::<Fence>(this)
+    // Under the waits' lock: [`waits_note`] reads the fences it names.
+    let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+    let left = object::release_boxed::<Fence>(this);
+    if left == 0 {
+        waiting.retain(|w| w.0 != this as usize);
+    }
+    left
 }
 pub(crate) extern "system" fn completed(this: This) -> u64 {
     fence(this).value.load(Ordering::Acquire)
@@ -116,6 +158,10 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return E_NOTIMPL;
     }
     waiters.push((value, event as usize));
+    let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+    if waiting.len() < WAITING_MOST {
+        waiting.push((this as usize, value, now_ms()));
+    }
     S_OK
 }
 /// Moves the fence to `value` and sets the events that waited for it.
@@ -132,6 +178,10 @@ pub(crate) fn set(this: This, value: u64) {
         }
         !reached
     });
+    let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+    if !waiting.is_empty() {
+        waiting.retain(|&(f, wanted, _)| f != this as usize || wanted > value);
+    }
 }
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     set(this, value);

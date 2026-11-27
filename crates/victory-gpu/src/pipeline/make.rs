@@ -529,6 +529,12 @@ fn variant<'a>(p: &'a Arc<Pending>, g: &GraphicsState, bound: &TargetFormats) ->
     p
 }
 
+/// Whether `p` is made, without making it: `None` not yet, else whether it
+/// has a host pipeline.
+pub(crate) fn made(p: &Pending) -> Option<bool> {
+    p.made.get().map(|made| made.is_some())
+}
+
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {

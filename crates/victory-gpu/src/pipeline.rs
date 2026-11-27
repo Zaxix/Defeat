@@ -363,6 +363,26 @@ pub(crate) fn walk_held(this: This) -> bool {
     true
 }
 
+/// The structure builder's state, for a line about a stall.
+#[cfg(windows)]
+pub(crate) fn builder_note() -> String {
+    let b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    // Asked without making any (`make::now` would make them here).
+    let made = b.pipelines.iter().filter(|p| make::made(p) == Some(true)).count();
+    let refused = b.pipelines.iter().filter(|p| make::made(p) == Some(false)).count();
+    format!(
+        "the ray-tracing structure builder: {} pipelines created by the title, {made} with a host pipeline, {refused} without one, {}",
+        b.pipelines.len(),
+        if b.off {
+            "turned off"
+        } else if b.whole {
+            "running"
+        } else {
+            "not started"
+        }
+    )
+}
+
 /// Whether the title's pipeline `this` is one of the structure builder's.
 #[cfg(windows)]
 pub(crate) fn is_builder(this: This) -> bool {

@@ -598,6 +598,19 @@ fn submitting(phase: u64, lists: usize) {
     SUBMITTING[0].store(phase, Ordering::Relaxed);
 }
 
+/// What the layer is doing, for a line about a stall of the title's main
+/// thread (the app's watch of the title's watchdog): the title's fence
+/// waits outstanding, the structure builder, and what [`removal_context`]
+/// says (the submitting thread, the pipeline library, the trail).
+pub fn stall_report() -> String {
+    format!(
+        "{}; {}; {}",
+        crate::fence::waits_note(),
+        crate::pipeline::builder_note(),
+        removal_context()
+    )
+}
+
 /// What was going on when the host device went: whether a submission was
 /// on the card, the pipeline library's state and the calls running in it,
 /// and the trail.

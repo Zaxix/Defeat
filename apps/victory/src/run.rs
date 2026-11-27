@@ -36,6 +36,9 @@ pub fn run(
     // physical memory: run 65's memory map).
     drop(prepared);
     drop(original);
+    // Before any title code runs: its hang watchdog watched, and kept from
+    // ending the run with `VICTORY_NO_WATCHDOG=1`.
+    crate::watchdog::arm(image.base(), &hash);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
     println!(

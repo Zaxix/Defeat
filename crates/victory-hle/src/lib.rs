@@ -19,6 +19,10 @@ pub mod runtime;
 pub use host::HostPolicy;
 pub use registry::{HleExport, HleModule, registry};
 pub use victory_gpu::console;
+/// What the layer was doing, for a line about a stall of the title's main
+/// thread (`victory`'s watchdog watch).
+#[cfg(windows)]
+pub use victory_gpu::stall_report;
 
 use victory_loader::{ImportResolver, Provenance, Resolution};
 use victory_pe::ImportSymbol;

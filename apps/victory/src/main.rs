@@ -8,6 +8,8 @@ mod inspect;
 mod run;
 mod shader;
 mod translate;
+#[cfg(windows)]
+mod watchdog;
 
 use std::path::PathBuf;
 
