@@ -10880,6 +10880,19 @@ impl Meter {
                      hold still (the runtime remapping it); the rest is reading, hashing and detiling"
                 );
             }
+            let [hashed, hash_us, unchanged] =
+                [0, 1, 2].map(|i| crate::texture::DIGESTED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if hashed > 0.0 {
+                tracing::info!(
+                    "texture change checks per frame: {:.1} MB hashed in {:.2} ms ({}; VICTORY_TEXTURE_DIGEST=blake3 for the old \
+                     hash), {:.1} MB of it found unchanged (neither detiled again nor sent up), {:.1} MB changed",
+                    hashed / 1e6,
+                    hash_us / 1e3,
+                    if crate::texture::digest_blake3() { "blake3" } else { "xxh3" },
+                    unchanged / 1e6,
+                    (hashed - unchanged).max(0.0) / 1e6
+                );
+            }
             let [cpu_us, cpu_bytes, cpu_textures] =
                 [0, 1, 2].map(|i| crate::texture::DETILED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             let [card_textures, card_dispatches, card_bytes, card_us, card_made, card_refused] =

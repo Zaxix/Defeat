@@ -130,6 +130,47 @@ fn linear_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource
 /// (microseconds, all threads), the bytes of title memory detiled, the
 /// textures.
 pub(crate) static DETILED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// Since the last frame-rate line, of the checks whether a texture's
+/// memory changed ([`digest`]): the bytes hashed, the time it took
+/// (microseconds, all threads), and the bytes of those found as they were
+/// (neither detiled again nor sent up). The refresh's count of bytes read
+/// (`crate::host::PREPARING`) holds these too: it is no count of uploads.
+pub(crate) static DIGESTED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// What a texture's memory was when its staging buffer was last filled, for
+/// telling whether it changed: 128 bits, of xxh3 by default, or the first
+/// 128 of blake3 (`VICTORY_TEXTURE_DIGEST=blake3`, the hash used before).
+/// Not a guard against a title making collisions on purpose; for memory
+/// that changes by itself two different contents that hash alike are
+/// about as likely as with blake3's 128 bits.
+type Digest = u128;
+
+/// Whether [`digest`] is blake3's (`VICTORY_TEXTURE_DIGEST=blake3`).
+pub(crate) fn digest_blake3() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_TEXTURE_DIGEST").is_ok_and(|v| v.trim().eq_ignore_ascii_case("blake3")))
+}
+
+/// The [`Digest`] of `bytes`, counted in [`DIGESTED`]. On a Ryzen without
+/// AVX-512 blake3 hashes about 2.3 GB/s on one thread and xxh3 about 5
+/// (memory-bound) on texture-sized buffers that are not in the cache: some
+/// 20 ms less for each 100 MB checked.
+fn digest(bytes: &[u8]) -> Digest {
+    use std::sync::atomic::Ordering::Relaxed;
+    let started = std::time::Instant::now();
+    let digest = if digest_blake3() {
+        let hash = blake3::hash(bytes);
+        let mut first = [0u8; 16];
+        first.copy_from_slice(&hash.as_bytes()[..16]);
+        u128::from_le_bytes(first)
+    } else {
+        xxhash_rust::xxh3::xxh3_128(bytes)
+    };
+    DIGESTED[0].fetch_add(bytes.len() as u64, Relaxed);
+    DIGESTED[1].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    digest
+}
+
 /// Since the last frame-rate line: the bytes detiled either way, by
 /// swizzle mode (`victory_formats::texture::Swizzle` numbers 0 to 27).
 pub(crate) static BY_MODE: [std::sync::atomic::AtomicU64; 28] = [const { std::sync::atomic::AtomicU64::new(0) }; 28];
@@ -231,13 +272,26 @@ fn spare_most() -> u64 {
 /// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
+    hash: Option<Digest>,
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
     /// The frame it was read in ahead of its submission
     /// ([`Staging::refresh_ahead`]).
     ahead: Option<u64>,
+}
+
+impl Last {
+    /// Notes `digest` as what the staging buffer holds now; true if it held
+    /// that already (`bytes` are then counted unchanged in [`DIGESTED`]).
+    fn unchanged(&mut self, digest: Digest, bytes: usize) -> bool {
+        if self.hash == Some(digest) {
+            DIGESTED[2].fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+            return true;
+        }
+        self.hash = Some(digest);
+        false
+    }
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -1211,11 +1265,9 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = blake3::hash(read);
-                if last.hash == Some(hash) {
+                if last.unchanged(digest(read), size) {
                     return false;
                 }
-                last.hash = Some(hash);
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
@@ -1231,13 +1283,12 @@ impl Staging {
         }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
-                let hash = blake3::hash(tiled);
+                let digest = digest(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-                if last.hash == Some(hash) {
+                if last.unchanged(digest, size) {
                     return size;
                 }
-                last.hash = Some(hash);
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -1247,13 +1298,12 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        let digest = digest(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
+        if last.unchanged(digest, size) {
             return size;
         }
-        last.hash = Some(hash);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -1282,7 +1332,7 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            last.hash = Some(blake3::hash(read));
+            last.hash = Some(digest(read));
             self.detile(read);
             last.asked = now;
             last.ahead = Some(crate::frame::current());
@@ -1740,9 +1790,7 @@ fn refresh_unlocked_with(
     use std::sync::atomic::Ordering::Relaxed;
     let read = with_read(size, |read| {
         if crate::host::read_into(memory, read) {
-            let hash = blake3::hash(read);
-            if last.hash != Some(hash) {
-                last.hash = Some(hash);
+            if !last.unchanged(digest(read), size) {
                 detile(read);
             }
             return true;
@@ -1753,7 +1801,7 @@ fn refresh_unlocked_with(
         if last.hash.is_none() && no_wait_partial() {
             crate::host::copy_mapped(read.as_mut_ptr(), memory, size, false);
             if read.iter().any(|&b| b != 0) {
-                last.hash = Some(blake3::hash(read));
+                last.hash = Some(digest(read));
                 last.partial = Some(crate::frame::current());
                 detile(read);
                 return true;
@@ -1917,5 +1965,54 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod digest_tests {
+    use super::{Last, digest};
+
+    /// One bit flipped anywhere (the first byte, inside, the last one, in
+    /// a tail shorter than a block) changes the digest; equal bytes give
+    /// the same one.
+    #[test]
+    fn a_flipped_bit_anywhere_changes_the_digest() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for len in [1usize, 15, 16, 17, 64, 240, 241, 4096, 65_536 + 7, 1 << 20] {
+            let bytes: Vec<u8> = (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state as u8
+                })
+                .collect();
+            let first = digest(&bytes);
+            assert_eq!(first, digest(&bytes.clone()), "{len} bytes: the same bytes");
+            for at in [0, len / 3, len / 2, len - 1] {
+                for bit in [0u8, 7] {
+                    let mut changed = bytes.clone();
+                    changed[at] ^= 1 << bit;
+                    assert_ne!(first, digest(&changed), "{len} bytes, bit {bit} of byte {at}");
+                }
+            }
+        }
+        // Zeros of two lengths differ (a texture's level that grew).
+        assert_ne!(digest(&[0; 4096]), digest(&[0; 4097]));
+    }
+
+    /// The staging buffer's note: a first digest is new, the same one again
+    /// is unchanged, another one is new and replaces it.
+    #[test]
+    fn last_notes_what_it_holds() {
+        let mut last = Last::default();
+        let a = digest(b"level 0");
+        let b = digest(b"level 1");
+        assert!(!last.unchanged(a, 7));
+        assert_eq!(last.hash, Some(a));
+        assert!(last.unchanged(a, 7));
+        assert!(!last.unchanged(b, 7));
+        assert_eq!(last.hash, Some(b));
+        assert!(!last.unchanged(a, 7), "back to what it held before: changed again");
     }
 }
