@@ -29,7 +29,27 @@
 //!   73,500 -> 58 times, frames of over 300 draws 225 -> 195 ms);
 //! - `VICTORY_RECHECK_SOON`: a texture picked by index found changed is
 //!   looked at again the next frame, not four frames later (on by default
-//!   in the AMD sibling repository).
+//!   in the AMD sibling repository);
+//! - `VICTORY_SETTLE_ROOM`: flights get twice the room before "lists in
+//!   the air" settles them (the base: 11.5 ms less of the preparing
+//!   thread's work a frame; run 12 here waited 14-29 ms a frame there);
+//! - `VICTORY_LOOKUP_CACHE`: each recording thread remembers what its asks
+//!   for a buffer's host copy found (the base, run 293: about 14 ms a
+//!   frame; the pull request has it on by default);
+//! - `VICTORY_PARALLEL_REFRESH`: a submission's texture checks run side by
+//!   side on the helper threads (the base, two launches: 8.7 and 9.4 ms
+//!   less of the preparing thread's work a frame);
+//! - `VICTORY_CARD_SYNC_BATCH`: the list that brings copies in the card's
+//!   memory up to date records all its copies, one state change, then all
+//!   its hash passes, not copy by copy (fork pull request #1227, on by
+//!   default there: the card's send-and-hash lists 24-28 -> 5.3-5.7 ms a
+//!   frame);
+//! - `VICTORY_REFRESH_PAGES`: a refresh of watched title memory takes the
+//!   whole 64 KiB pages it touches (run 12 on the owner's PC: frames of
+//!   over 300 draws 195 -> 171 ms median, copies 104 -> 89 MB a frame).
+//!
+//! `SETTLE_ROOM`, `LOOKUP_CACHE`, `PARALLEL_REFRESH` and `CARD_SYNC_BATCH`
+//! also take `alt` (twenty seconds each way, in turn).
 //!
 //! Each still takes its own `=0` (or `=1`); `VICTORY_FAST=0` puts every
 //! one of them back to off, as in runs 1-9, in one go.
@@ -37,7 +57,7 @@
 use std::sync::OnceLock;
 
 /// The switches [`on`] gives a default to, for the start-up line.
-const SWITCHES: [&str; 9] = [
+const SWITCHES: [&str; 14] = [
     "VICTORY_ASYNC_SUBMIT",
     "VICTORY_QUEUE2",
     "VICTORY_COPY_PLAIN",
@@ -47,6 +67,11 @@ const SWITCHES: [&str; 9] = [
     "VICTORY_WIDE_MERGE",
     "VICTORY_RECHECK_SOON",
     "VICTORY_LEVELS_ON_DEMAND",
+    "VICTORY_SETTLE_ROOM",
+    "VICTORY_LOOKUP_CACHE",
+    "VICTORY_PARALLEL_REFRESH",
+    "VICTORY_CARD_SYNC_BATCH",
+    "VICTORY_REFRESH_PAGES",
 ];
 
 /// Whether the faster defaults hold (`VICTORY_FAST`, unset or anything but

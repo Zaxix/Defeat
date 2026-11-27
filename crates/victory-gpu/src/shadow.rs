@@ -372,7 +372,8 @@ fn changed_list() -> bool {
 }
 
 /// Whether a refresh of watched memory takes the whole 64 KiB pages its
-/// range touches (`VICTORY_REFRESH_PAGES=1`; off by default). A page only
+/// range touches (`VICTORY_REFRESH_PAGES`; with the faster defaults, `=0`
+/// off). A page only
 /// partly in a refreshed range is copied in part and stays stale for the
 /// rest (`Shadow::copy_stale`), so every later refresh that reaches it
 /// copies it again, written or not; taken whole, it is copied again only
@@ -386,7 +387,10 @@ fn changed_list() -> bool {
 fn refresh_pages() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_REFRESH_PAGES").is_some_and(|v| v == "1");
+        // Among the faster defaults (`crate::fast`) since run 12 carried it:
+        // frames of over 300 draws 195 -> 171 ms median, copies 104 -> 89
+        // MB a frame, no device loss.
+        let on = crate::fast::on("VICTORY_REFRESH_PAGES");
         if on {
             tracing::info!("refreshes of watched title memory take whole 64 KiB pages (VICTORY_REFRESH_PAGES=1)");
         }
@@ -4292,23 +4296,28 @@ impl Shadow {
                             }
                             let exact = changed_runs(title, held);
                             self.card_patched(at, title, &exact);
-                            for &(r, m) in &exact {
-                                held[r..r + m].copy_from_slice(&title[r..r + m]);
-                                MERGED[1].fetch_add(1, Ordering::Relaxed);
-                                MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
-                            }
+                            // The page as the title has it: the bytes outside
+                            // the runs are equal already, so one copy of it
+                            // is the runs' copies (a page of the world's
+                            // buffers held up to ~10,000 runs; run 12: 478,000
+                            // a frame, each a copy and two counts here).
+                            held.copy_from_slice(title);
+                            MERGED[1].fetch_add(exact.len() as u64, Ordering::Relaxed);
+                            MERGED[2].fetch_add(exact.iter().map(|r| r.1 as u64).sum::<u64>(), Ordering::Relaxed);
                         } else {
                             MERGE_GAVE_UP[2].fetch_add(1, Ordering::Relaxed);
                             return true;
                         }
                     } else {
                         *runs_left -= runs.len();
-                        for (r, m) in runs {
+                        let mut bytes = 0u64;
+                        for &(r, m) in &runs {
                             held[r..r + m].copy_from_slice(&title[r..r + m]);
                             self.card_changed(at + r, at + r + m);
-                            MERGED[1].fetch_add(1, Ordering::Relaxed);
-                            MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                            bytes += m as u64;
                         }
+                        MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                        MERGED[2].fetch_add(bytes, Ordering::Relaxed);
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
@@ -4319,15 +4328,18 @@ impl Shadow {
                     // bytes at the copy's offsets (`writing`), and these
                     // are in a declared range.
                     let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
+                    let (mut count, mut bytes) = (0u64, 0u64);
                     for (r, m) in changed_runs(title, held) {
                         // SAFETY: inside the copy's mapping. The card may be
                         // writing the copy beside these bytes; they are
                         // written here and nothing around them.
                         unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        count += 1;
+                        bytes += m as u64;
                     }
+                    MERGED[1].fetch_add(count, Ordering::Relaxed);
+                    MERGED[2].fetch_add(bytes, Ordering::Relaxed);
                 }
                 drop(before);
                 // Taken, if the range holds all of the page that is in the
@@ -5218,6 +5230,8 @@ fn lookup_cache() -> bool {
     match *MODE.get_or_init(|| match std::env::var("VICTORY_LOOKUP_CACHE").as_deref() {
         Ok("1") => 1,
         Ok("alt") => 2,
+        // Unset: on with the faster defaults (`crate::fast`).
+        Err(_) => u8::from(crate::fast::fast()),
         _ => 0,
     }) {
         0 => false,

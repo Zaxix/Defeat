@@ -86,6 +86,20 @@ static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// frame line's "preparing" had 19 to 23 ms a frame no line split (run 282).
 static PREP_PARTS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
+/// Microseconds of the first part of [`PREP_PARTS`] by what it did: the
+/// write-watch asking (`crate::watch::ask_once`) and the look for (and
+/// merge of) title bytes under flights' writes ([`stale_under_flights`]).
+/// Run 12 had 24-33 ms a frame in that part and nothing split it.
+static PREP_FIRST: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// [`stale_under_flights`], its time added to [`PREP_FIRST`].
+fn stale_under_flights_timed(runs: &[&HostList]) -> bool {
+    let started = std::time::Instant::now();
+    let stale = stale_under_flights(runs);
+    PREP_FIRST[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    stale
+}
+
 /// Adds the time since `since` to part `i` of [`PREP_PARTS`]; now.
 fn prep_part(i: usize, since: std::time::Instant) -> std::time::Instant {
     let now = std::time::Instant::now();
@@ -3871,6 +3885,8 @@ fn settle_room() -> bool {
     match *MODE.get_or_init(|| match std::env::var("VICTORY_SETTLE_ROOM").as_deref() {
         Ok("1") => 1,
         Ok("alt") => 2,
+        // Unset: on with the faster defaults (`crate::fast`).
+        Err(_) => u8::from(crate::fast::fast()),
         _ => 0,
     }) {
         0 => false,
@@ -4839,6 +4855,8 @@ fn sync_batched() -> bool {
     match *MODE.get_or_init(|| match std::env::var("VICTORY_CARD_SYNC_BATCH").as_deref() {
         Ok("1") => 1,
         Ok("alt") => 2,
+        // Unset: on with the faster defaults (`crate::fast`).
+        Err(_) => u8::from(crate::fast::fast()),
         _ => 0,
     }) {
         0 => false,
@@ -5371,12 +5389,15 @@ fn late_line(frames: f64) {
     }
     {
         let parts = [0, 1, 2, 3, 4, 5].map(|i| PREP_PARTS[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
+        let first = [0, 1].map(|i| PREP_FIRST[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
         tracing::info!(
             "a submission's preparing by part, ms per frame: the write-watch asking and the look for title bytes under flights \
-             (settles for them included) {:.1}; the lists' steps (title copies, fills, preludes; refreshes are only noted) {:.1}; \
+             (settles for them included) {:.1} (the asking {:.1}, the look and merge under flights {:.1}); the lists' steps (title copies, fills, preludes; refreshes are only noted) {:.1}; \
              the refreshes (the flush) {:.1}; snapshots and the wait for card results {:.1}; the card copies' send and hash lists \
              (card_before) {:.1}; handing the lists to the card and signalling {:.1}",
             parts[0],
+            first[0],
+            first[1],
             parts[1],
             parts[2],
             parts[3],
@@ -7696,17 +7717,18 @@ impl Host {
             }
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
             crate::watch::ask_once(&ranges);
+            PREP_FIRST[0].fetch_add(part.elapsed().as_micros() as u64, Ordering::Relaxed);
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if behind && stale_under_flights(runs) {
+            if behind && stale_under_flights_timed(runs) {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
             }
-        } else if behind && stale_under_flights(runs) {
+        } else if behind && stale_under_flights_timed(runs) {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
@@ -10607,6 +10629,8 @@ fn parallel_refresh() -> bool {
     match *MODE.get_or_init(|| match std::env::var("VICTORY_PARALLEL_REFRESH").as_deref() {
         Ok("1") => 1,
         Ok("alt") => 2,
+        // Unset: on with the faster defaults (`crate::fast`).
+        Err(_) => u8::from(crate::fast::fast()),
         _ => 0,
     }) {
         0 => false,
