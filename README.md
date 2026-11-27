@@ -72,6 +72,7 @@ status table).
 | 3 | The world at night: city lights, the character | ~0.2–1 fps | No shader-cache hits: an edit of ours had changed the cache key; video memory at its budget (~10.9 GB), ~23,000 texture slots waiting for room | Cache key frozen (`shader_cache.key`) |
 | 4 | First story cutscene, with sound; very dark | 0.1–1.8 fps | Caches work (1,509 shader hits, 1,698 pipelines from the library); two frames waited 13.6 and 14.6 s for four compute pipelines; card at 10.2–11.9 GB of a ~10.4 GB budget | Compute pipelines started at creation (overdone, see run 5); a true 10 s limit; drop reasons logged |
 | 5 | Further into the cutscene; people visible, faces black | 0.1–2 fps in the world | Dropped draws are now ~all the switched-off ray-tracing builder's; compute-at-creation queued ~2,900 pipelines on all 12 workers, CPU 99 % for the whole run, and everything CPU-side (copy-back 260–1,000 ms, texture refreshes up to 1.7 s waiting on title remaps, the heap pass) slowed with it; 12 compute pipelines refused by the driver, 5 compute shaders do not translate | Spare compute pipelines on at most 2 workers, last; a refused pipeline logs the wave size it asks for |
+| 6 | The cutscene and its credits | 0.1–2.8 fps in the world | The CPU no longer pinned (about 6 of 16 processors); all 12 refused pipelines ask for 64-lane waves, which the RTX 4070 does not run; the largest cost a frame is texture refreshes waiting for the game to finish remapping memory (0.4–2.3 s); the card's memory just over its budget | Compute waits on several threads at once share one deadline (two frames had gone 3 s past the limit) |
 
 **Why the picture is dark:** the game lights much of its scene with ray tracing (bounce light, lamp
 and sun shadows). With the builder off nothing is traced, so whatever direct light does not reach is
@@ -79,7 +80,7 @@ black (the gta6 base sees the same on its PC, below). Texture slots also wait fo
 (about 20,000 in run 5; run 295 of the base found the same). Black faces may be one of these or the
 skin pass; not known yet.
 
-**What limits the frame rate now:** the CPU. In run 5 the card was busy about a quarter of the time.
+**What limits the frame rate now:** waits on the CPU side, mostly for the game's memory remapping while it streams textures (run 6). The card itself is busy only a small part of each frame.
 
 ## Status of the gta6 base on its tester's PC (fxceless; inherited, 2026-11-27, 03:45 UTC)
 
