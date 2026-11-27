@@ -1290,6 +1290,34 @@ fn merge_race_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_RACE").is_some_and(|v| v == "1"))
 }
 
+/// Whether a merge writes back to title memory only the 4-byte words the
+/// card changed (`VICTORY_MERGE_WORDS=1`; off by default), instead of its
+/// whole stretch from the first changed byte to the last. The whole
+/// stretch also stores the title's own bytes in between with the values
+/// the merge read, so a title write that lands between that read and the
+/// write-back is undone ([`merge_race`] counts these as "put back"). Words
+/// alone leave every byte the card did not change as the title has it; a
+/// title byte in a word the card also wrote still takes the card's. The
+/// cost: a write per run of words instead of one per stretch.
+fn merge_words_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_WORDS").is_some_and(|v| v == "1"))
+}
+
+/// Writes a merge's result `merged` over title memory at `address`: the
+/// whole stretch, or with [`merge_words_on`] (and `read`, the stretch as
+/// the merge read it) only the runs of words where they differ.
+fn write_merged(address: usize, read: Option<&[u8]>, merged: &[u8]) {
+    match read {
+        Some(read) if merge_words_on() => {
+            word_runs(address, read, merged, |off, len| {
+                crate::host::write_mapped((address + off) as *mut u8, merged[off..].as_ptr(), len);
+            });
+        }
+        _ => crate::host::write_mapped(address as *mut u8, merged.as_ptr(), merged.len()),
+    }
+}
+
 /// [`merge_race`]'s sums. Of frame `frame`, and in `total` since the
 /// start: stretches written back, their bytes, title bytes put back to
 /// older values, bytes the title and the card both changed, stretches with
@@ -1334,7 +1362,9 @@ fn merge_race(read: Option<&[u8]>, copy: (u64, u64), address: usize, merged: &[u
     let mut runs: Vec<(usize, usize)> = Vec::new();
     word_runs(address, read, merged, |off, len| runs.push((off, len)));
     let whole = [(0, n)];
-    let looked: &[(usize, usize)] = &whole;
+    // With words alone, only the runs are written: a title byte between
+    // them is not put back whatever happened to it.
+    let looked: &[(usize, usize)] = if merge_words_on() { &runs } else { &whole };
     let mut again = vec![0u8; n];
     let (mut put_back, mut both, mut first) = (0u64, 0u64, None);
     if crate::host::read_into(address as *const u8, &mut again) {
@@ -2868,6 +2898,39 @@ mod merge_tests {
         assert_eq!(runs, [(0, 1), (3, 1)], "the GPU's bytes only");
     }
 
+    /// A title write that lands between a relay merge's read of title memory
+    /// and its write-back: the whole stretch puts the byte back to what the
+    /// merge read; the card's words alone (`VICTORY_MERGE_WORDS=1`) leave it
+    /// as the title wrote it, and still store every word the card changed.
+    #[test]
+    fn words_alone_keep_a_title_write_that_lands_after_the_merge_read() {
+        let address = 0x1000;
+        let mut held = vec![0u8; 16];
+        let mut now = held.clone();
+        now[0..4].copy_from_slice(&[1, 2, 3, 4]); // the card's word 0
+        now[13] = 6; // and one byte of word 3
+        let mut title = vec![9u8; 16];
+        let read = title.clone();
+        assert!(merge_piece(&now, &mut held, &mut title));
+        // The title writes byte 6 after the merge read it.
+        let mut memory = read.clone();
+        memory[6] = 0x77;
+        let mut whole = memory.clone();
+        whole.copy_from_slice(&title);
+        assert_eq!(whole[6], 9, "the whole stretch puts the title's write back");
+        let mut words = memory.clone();
+        let mut runs = Vec::new();
+        word_runs(address, &read, &title, |off, len| {
+            runs.push((off, len));
+            words[off..off + len].copy_from_slice(&title[off..off + len]);
+        });
+        assert_eq!(runs, [(0, 4), (12, 4)], "the two words the card wrote, whole");
+        assert_eq!(words[0..4], [1, 2, 3, 4]);
+        assert_eq!(words[12..16], [9, 6, 9, 9]);
+        assert_eq!(words[6], 0x77, "the title's write stays");
+        assert_eq!(words[4..12], memory[4..12], "nothing between the words is stored");
+    }
+
     /// The runs are the ones a walk byte by byte finds, for lengths around
     /// the steps of eight and sixty-four the compare takes, and for bytes
     /// that differ one here and there, in stretches, and nearly everywhere.
@@ -3687,7 +3750,7 @@ impl Shadow {
         }
         // The stretch as read: what the card did not change is the
         // title's, and may have been written again since.
-        let as_read = merge_race_on().then(|| title.clone());
+        let as_read = (merge_race_on() || merge_words_on()).then(|| title.clone());
         if !merge_piece(now, held, title) {
             return 0;
         }
@@ -3699,7 +3762,7 @@ impl Shadow {
         }
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "pc relay");
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        write_merged(start + at, as_read.as_deref(), &title[..]);
         #[cfg(feature = "diagnostics")]
         crate::backreads::stored(self.id, (self.start, self.len), start + at, n, false);
         n
@@ -4651,7 +4714,7 @@ impl Shadow {
         if crate::host::read_into((start + at) as *const u8, title) {
             // The stretch as read: what the card did not change is the
             // title's, and may have been written again since.
-            let as_read = merge_race_on().then(|| title.clone());
+            let as_read = (merge_race_on() || merge_words_on()).then(|| title.clone());
             // As in `copy_back`: the card's byte where it is not what it
             // was before the submission, else the title's.
             let mut differs = 0u8;
@@ -4666,7 +4729,7 @@ impl Shadow {
                 crate::host::shaders_write(start + at, &title[..]);
                 crate::watch::writing(start + at, n);
                 merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                write_merged(start + at, as_read.as_deref(), &title[..]);
                 written = n;
             }
         } else {
@@ -4740,7 +4803,7 @@ impl Shadow {
         let mapped = crate::host::read_into((start + at) as *const u8, title);
         // The stretch as read: what the card did not change is the
         // title's, and may have been written again since.
-        let as_read = (mapped && merge_race_on()).then(|| title.clone());
+        let as_read = (mapped && (merge_race_on() || merge_words_on())).then(|| title.clone());
         let mut changed = false;
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
@@ -4759,7 +4822,7 @@ impl Shadow {
         }
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        write_merged(start + at, as_read.as_deref(), &title[..]);
         #[cfg(feature = "diagnostics")]
         crate::backreads::stored(self.id, (self.start, self.len), start + at, n, false);
         n
