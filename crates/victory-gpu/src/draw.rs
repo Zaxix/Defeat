@@ -5000,8 +5000,9 @@ fn spread_on() -> bool {
 
 /// Whether a spread indirect dispatch of at most
 /// [`crate::indirect::LEAN_RECORDS`] records runs lean
-/// (`VICTORY_SPREAD_LEAN`: off by default; `1` on; `alt` twenty seconds
-/// with, twenty without, in turn, each change said in the log): the clamp
+/// (`VICTORY_SPREAD_LEAN`: on by default on NVIDIA cards, off on others;
+/// `1` on; `0` off; `alt` twenty seconds with, twenty without, in turn,
+/// each change said in the log): the clamp
 /// writes its records within 65,535 groups in x for the plain dispatch
 /// signature and the others for the spread signature, which runs under a
 /// predicate the clamp sets only when a record passes 65,535. An
@@ -5009,16 +5010,35 @@ fn spread_on() -> bool {
 /// some cards than a plain one (an RTX 3060: about 13 ms of the card's time
 /// a frame for ~1,000 of them, of which ~1 a frame passes 65,535), and
 /// nothing is clamped to 65,535 either way.
+///
+/// On by default on NVIDIA only: upstream fork pull request #1352 measured
+/// it there (RTX 3060: the card's time 108 to 91 ms a frame; RTX 5080
+/// under Proton about twice the frames; an RTX 5060 laptop held by the PC,
+/// unchanged), and no AMD card has run it.
 fn spread_lean_on() -> bool {
-    /// 0 off, 1 on, 2 in turn.
+    /// 0 off, 1 on, 2 in turn, 3 unset (by the card).
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    match *MODE.get_or_init(|| match std::env::var("VICTORY_SPREAD_LEAN").as_deref() {
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_SPREAD_LEAN").as_deref().map(str::trim) {
         Ok("1") => 1,
         Ok("alt") => 2,
-        _ => 0,
+        Ok("0") => 0,
+        _ => 3,
     }) {
         0 => false,
         1 => true,
+        // Asked at each recording: the device is made before any list.
+        3 => {
+            let vendor = crate::host::host_vendor();
+            let on = vendor == crate::host::NVIDIA;
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                tracing::info!(
+                    "indirect dispatches spread across z run lean: {} (the card's maker {vendor:#x}; VICTORY_SPREAD_LEAN=0 or 1 decides instead)",
+                    if on { "on, an NVIDIA card" } else { "off, not an NVIDIA card" }
+                );
+            });
+            on
+        }
         _ => {
             static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
             let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;

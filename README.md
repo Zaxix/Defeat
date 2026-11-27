@@ -126,7 +126,7 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
   (texture read-backs re-registered after the title reuses their memory), #1380 (`clzero` on a guarded
   line goes through the guard), #1367 (scratch chunks reused at any size; the spare cap is kept at 128
   MiB here, `VICTORY_SCRATCH_SPARE_MB` raises it), #1392 (a never-filled texture with missing pages
-  is read with zeros for them), #1352 (`VICTORY_SPREAD_LEAN`, off), #1312 (a dispatch waits for its
+  is read with zeros for them), #1352 (`VICTORY_SPREAD_LEAN`, on by default on NVIDIA cards in this fork, off on others), #1312 (a dispatch waits for its
   compute pipeline: dark lamps after a fresh cache), and earlier today #1320, #1321, #1336, #1353.
 - **Translator:** raw loads ask only for the dwords that are read; `VICTORY_SHADER_OPT` bit 128 writes
   the float operations with the fast-math flag (off: it puts black blotches on skin and

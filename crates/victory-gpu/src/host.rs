@@ -1412,6 +1412,9 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
+        if let Some(desc) = adapter.as_ref().and_then(|a| a.GetDesc1().ok()) {
+            HOST_VENDOR.store(desc.VendorId, Ordering::Relaxed);
+        }
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -1600,6 +1603,18 @@ mod tests {
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
     }
+}
+
+/// The PCI vendor id of the host device's adapter, once the device is
+/// made; 0 before, or if the adapter did not say.
+static HOST_VENDOR: AtomicU32 = AtomicU32::new(0);
+
+/// NVIDIA's PCI vendor id.
+pub(crate) const NVIDIA: u32 = 0x10de;
+
+/// The PCI vendor id of the host device's adapter (0: not known yet).
+pub(crate) fn host_vendor() -> u32 {
+    HOST_VENDOR.load(Ordering::Relaxed)
 }
 
 /// A host command list and its allocator, always used together.
