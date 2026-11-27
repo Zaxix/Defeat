@@ -591,6 +591,12 @@ pub(crate) fn pipeline(
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    /// One save at a time, from its serialising to its renames: the
+    /// serialising alone was locked, so a second save (`now`, at the end)
+    /// could write the temporary file while the first renamed it, and the
+    /// library's file be the second's bytes in part (research checklist
+    /// R28).
+    static ONE_SAVE: Mutex<()> = Mutex::new(());
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
@@ -600,6 +606,18 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
+    // A save of the workers' (`now` false) while another runs is left to
+    // that one: they call this after every pipeline they make and must not
+    // wait seconds for a save. The last save (`now`) waits for it.
+    let _one_save = if now {
+        ONE_SAVE.lock().unwrap_or_else(|e| e.into_inner())
+    } else {
+        match ONE_SAVE.try_lock() {
+            Ok(held) => held,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        }
+    };
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
@@ -609,7 +627,7 @@ pub(crate) fn save(now: bool) {
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
     // of the library again: run 60's second save).
-    let bytes = {
+    let (bytes, added) = {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
@@ -618,7 +636,7 @@ pub(crate) fn save(now: bool) {
             return;
         }
         if added == 0 {
-            0
+            (0, 0)
         } else {
             // SAFETY: a plain query.
             let size = unsafe { library.library.GetSerializedSize() };
@@ -628,13 +646,26 @@ pub(crate) fn save(now: bool) {
                 let _ = std::fs::remove_file(&tmp);
                 return;
             }
-            library.added.store(0, Ordering::Relaxed);
-            SAVED.store(size as u64, Ordering::Relaxed);
-            size
+            (size, added)
         }
     };
     let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
+    // The pipelines this save holds count as saved only once its file is
+    // in place (they were counted so as soon as it was serialised: a
+    // rename that failed left them off the disk until another pipeline
+    // came, R28), and only those: ones stored since stay to be saved.
+    if bytes > 0 {
+        match &library_written {
+            Ok(()) => {
+                let _ = library.added.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(added)));
+                SAVED.store(bytes as u64, Ordering::Relaxed);
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+    }
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
         let in_place = !dir.join(NEXT_FILE).exists();
