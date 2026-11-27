@@ -210,11 +210,11 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         // limit that was only asked before each compile.
         if p.graphics.is_none()
             && (compute_waits() || frame < 600)
-            && let Some(left) = compute_wait_left(frame)
+            && let Some(left) = compute_wait_begin(frame)
         {
             let started = Instant::now();
             wait_compute(p, left);
-            compute_waited(frame, started.elapsed());
+            compute_wait_end(frame, started.elapsed());
         } else {
             wait(p, frame);
         }
@@ -327,49 +327,89 @@ fn compute_wait_most() -> Option<Duration> {
     })
 }
 
-/// The frame [`compute_wait_most`] is counted for, and what its making of
-/// compute pipelines on the title's threads took so far (summed over
-/// threads: a frame of several recording threads reaches the limit
-/// sooner, never later).
-static COMPUTE_SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+/// The frame [`compute_wait_most`] is counted for and its waits so far.
+static COMPUTE_SPENT: Mutex<ComputeBudget> = Mutex::new(ComputeBudget::new());
 
-/// What frame `frame` may still wait for compute pipelines
-/// ([`compute_wait_most`]; an hour without a limit); `None` past it.
-fn compute_wait_left(frame: u64) -> Option<Duration> {
+/// A frame's waits for compute pipelines: their time summed over the
+/// title's threads, and while any thread waits, the moment all of the
+/// frame's waits end.
+///
+/// Why the deadline: each wait was bounded by what the sum left when it
+/// began, and a wait's time joined the sum only when it ended, so waits on
+/// several recording threads at once each had the whole limit. Run 6 on the
+/// owner's PC: frames 2413 and 2414 waited 12.8 and 13.1 s against 10.
+/// Now a wait that begins while others wait ends with them at the latest.
+struct ComputeBudget {
+    frame: u64,
+    spent: Duration,
+    waiting: u32,
+    deadline: Option<Instant>,
+}
+
+impl ComputeBudget {
+    const fn new() -> Self {
+        Self { frame: u64::MAX, spent: Duration::ZERO, waiting: 0, deadline: None }
+    }
+
+    /// A wait of frame `frame` begins at `now`: for at most the returned
+    /// time, or `None` (not at all) past the limit `most`.
+    fn begin(&mut self, frame: u64, most: Duration, now: Instant) -> Option<Duration> {
+        if self.frame != frame {
+            *self = Self { frame, ..Self::new() };
+        }
+        let mut left = most.saturating_sub(self.spent);
+        if self.waiting > 0
+            && let Some(deadline) = self.deadline
+        {
+            left = left.min(deadline.saturating_duration_since(now));
+        }
+        if left.is_zero() {
+            return None;
+        }
+        self.waiting += 1;
+        if self.waiting == 1 {
+            self.deadline = Some(now + left);
+        }
+        Some(left)
+    }
+
+    /// A wait of frame `frame` that [`ComputeBudget::begin`] let begin took
+    /// `took`; true the once it takes the frame to `most`.
+    fn end(&mut self, frame: u64, took: Duration, most: Duration) -> bool {
+        if self.frame != frame {
+            return false;
+        }
+        self.waiting = self.waiting.saturating_sub(1);
+        if self.waiting == 0 {
+            self.deadline = None;
+        }
+        let before = self.spent;
+        self.spent += took;
+        before < most && self.spent >= most
+    }
+}
+
+/// A wait of frame `frame` for a compute pipeline begins: for at most the
+/// returned time ([`compute_wait_most`]; an hour without a limit), or not
+/// at all (`None`).
+fn compute_wait_begin(frame: u64) -> Option<Duration> {
     let Some(most) = compute_wait_most() else {
         return Some(Duration::from_secs(3600));
     };
-    left_in(&COMPUTE_SPENT.lock().unwrap_or_else(|e| e.into_inner()), frame, most)
+    COMPUTE_SPENT.lock().unwrap_or_else(|e| e.into_inner()).begin(frame, most, Instant::now())
 }
 
-/// [`compute_wait_left`] on a count `spent` (frame, time) and limit `most`.
-fn left_in(spent: &(u64, Duration), frame: u64, most: Duration) -> Option<Duration> {
-    let left = if spent.0 == frame { most.saturating_sub(spent.1) } else { most };
-    (!left.is_zero()).then_some(left)
-}
-
-/// Adds `took` to the count `spent` for frame `frame` (a new frame starts
-/// it again); true if that took it to `most`.
-fn add_to(spent: &mut (u64, Duration), frame: u64, took: Duration, most: Duration) -> bool {
-    if spent.0 != frame {
-        *spent = (frame, Duration::ZERO);
-    }
-    let before = spent.1;
-    spent.1 += took;
-    before < most && spent.1 >= most
-}
-
-/// Frame `frame` made a compute pipeline on the title's thread in `took`;
-/// said once a frame when that reaches [`compute_wait_most`].
-fn compute_waited(frame: u64, took: Duration) {
+/// The wait [`compute_wait_begin`] let begin took `took`; said once a frame
+/// when the frame's waits reach [`compute_wait_most`].
+fn compute_wait_end(frame: u64, took: Duration) {
     let Some(most) = compute_wait_most() else {
         return;
     };
-    let mut spent = COMPUTE_SPENT.lock().unwrap_or_else(|e| e.into_inner());
-    if add_to(&mut spent, frame, took, most) {
+    let mut budget = COMPUTE_SPENT.lock().unwrap_or_else(|e| e.into_inner());
+    if budget.end(frame, took, most) {
         tracing::warn!(
             frame,
-            waited_ms = spent.1.as_millis() as u64,
+            waited_ms = budget.spent.as_millis() as u64,
             "a frame waited this long for compute pipelines made for the first time; its other new ones are waited for within the \
              frame's budget and their dispatches dropped until made, so that the frame ends before the title's hang watchdog \
              (VICTORY_PIPELINE_COMPUTE_WAIT_MS)"
@@ -790,24 +830,50 @@ fn drained() {
 
 #[cfg(test)]
 mod tests {
-    use super::{add_to, left_in};
-    use std::time::Duration;
+    use super::ComputeBudget;
+    use std::time::{Duration, Instant};
 
     /// A frame may make compute pipelines on the title's thread until it
     /// has spent the limit on them; the next frame may again.
     #[test]
     fn a_frame_stops_waiting_for_compute_pipelines_at_the_limit() {
         let most = Duration::from_secs(10);
-        let mut spent = (u64::MAX, Duration::ZERO);
-        assert_eq!(left_in(&spent, 7, most), Some(most));
-        assert!(!add_to(&mut spent, 7, Duration::from_secs(9), most));
-        assert_eq!(left_in(&spent, 7, most), Some(Duration::from_secs(1)), "what is left of the limit");
-        assert!(add_to(&mut spent, 7, Duration::from_secs(2), most), "said once, when the limit is reached");
-        assert_eq!(left_in(&spent, 7, most), None, "past the limit");
-        assert!(!add_to(&mut spent, 7, Duration::from_secs(1), most), "not said again");
-        assert_eq!(left_in(&spent, 8, most), Some(most), "a new frame waits again");
-        assert!(!add_to(&mut spent, 8, Duration::from_millis(1), most));
-        assert_eq!(left_in(&spent, 8, most), Some(most - Duration::from_millis(1)));
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let mut b = ComputeBudget::new();
+        assert_eq!(b.begin(7, most, t0), Some(most));
+        assert!(!b.end(7, s(9), most));
+        assert_eq!(b.begin(7, most, t0 + s(9)), Some(s(1)), "what is left of the limit");
+        assert!(b.end(7, s(2), most), "said once, when the limit is reached");
+        assert_eq!(b.begin(7, most, t0 + s(11)), None, "past the limit");
+        assert_eq!(b.begin(8, most, t0 + s(12)), Some(most), "a new frame waits again");
+        assert!(!b.end(8, Duration::from_millis(1), most));
+        assert!(!b.end(7, s(5), most), "an old frame's wait counts for nothing");
+        assert_eq!(b.begin(8, most, t0 + s(13)), Some(most - Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn waits_at_once_on_several_threads_end_together() {
+        let most = Duration::from_secs(10);
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let mut b = ComputeBudget::new();
+        // Run 6: a second thread began 3 s into the first one's wait and
+        // was given the whole limit; now it ends with the first.
+        assert_eq!(b.begin(1, most, t0), Some(s(10)));
+        assert_eq!(b.begin(1, most, t0 + s(3)), Some(s(7)));
+        assert!(!b.end(1, s(4), most));
+        assert_eq!(b.begin(1, most, t0 + s(9)), Some(s(1)), "the first still waits: its deadline holds");
+        assert!(b.end(1, s(6), most));
+        assert!(!b.end(1, s(1), most));
+        // All done: the summed time is the limit, and no deadline is left.
+        assert_eq!(b.begin(1, most, t0 + s(20)), None);
+        assert_eq!(b.waiting, 0);
+        // A wait alone, after others ended, is bounded by the sum only.
+        let mut b = ComputeBudget::new();
+        assert_eq!(b.begin(2, most, t0), Some(s(10)));
+        assert!(!b.end(2, s(1), most));
+        assert_eq!(b.begin(2, most, t0 + s(30)), Some(s(9)), "the old deadline is gone");
     }
 
     #[test]
