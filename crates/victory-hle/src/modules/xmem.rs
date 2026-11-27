@@ -828,6 +828,18 @@ pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize
 /// is `VICTORY_PAGE_WRITES`' to say, and it counts either way). Call when
 /// the bytes are there, and without the page table's lock ([`shown_at`]
 /// takes and leaves it).
+/// Before the runtime writes bytes `[offset, offset + len)` of `pages`
+/// through a view of its own: every title address showing them is told
+/// first, as a kernel read into a plain address is
+/// (`victory_gpu::kernel_will_write`), so that a guarded block under it is
+/// opened, and its bytes from before saved, while they still are the bytes
+/// from before (#2503). [`pages_written`] still follows the write.
+pub(crate) fn pages_will_write(pages: &[usize], offset: usize, len: usize) {
+    for (at, bytes) in shown_at(pages, offset, len) {
+        victory_gpu::kernel_will_write(at, bytes);
+    }
+}
+
 pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
     for (at, bytes) in shown_at(pages, offset, len) {
         victory_gpu::title_memory_written(at, bytes, true);

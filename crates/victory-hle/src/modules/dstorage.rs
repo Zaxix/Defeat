@@ -1194,6 +1194,13 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     result
 }
 
+/// `VICTORY_PAGE_WRITES_BEFORE`: `1` tells the GPU side of a write into
+/// physical pages before it as well as after ([`into_destination`]).
+fn page_writes_before() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PAGE_WRITES_BEFORE").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
 /// many it produced. GPU-visible destinations are host memory like the
 /// rest (GPU address = CPU address), so an address is written in place;
@@ -1231,9 +1238,17 @@ fn into_destination(
             (offset + len).div_ceil(PAGE),
         )
     };
+    // `VICTORY_PAGE_WRITES_BEFORE=1`: the addresses showing these pages are
+    // told before the write as well as after (#2503: told only after, a
+    // block guarded under it may keep the new bytes as its bytes from
+    // before). Off by default until measured.
+    let before = page_writes_before();
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
+        if before {
+            super::xmem::pages_will_write(pages, offset, len);
+        }
         let filled = fill(window.bytes()).map(drop);
         drop(window);
         // The title maps pages where the card reads them and has them
@@ -1246,6 +1261,9 @@ fn into_destination(
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
+    if before {
+        super::xmem::pages_will_write(pages, offset, n);
+    }
     // A page the title has just made, or a view the host refuses for a
     // moment, comes right a little later: the write is tried again before
     // the request fails (`VICTORY_DSTORAGE_RETRIES`, 12 tries, about 0.9 s
