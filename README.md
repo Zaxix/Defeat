@@ -1,6 +1,12 @@
-# VIctory fork (work in progress)
+# Defeat (work in progress)
 
-> **Zaxix/VIctory `main`** (from 2026-11-27): built on fxceless's gta6 base,
+**Defeat** is Zaxix's fork of [VIctory](https://github.com/Marvisak/VIctory) (the name is
+the opposite of its parent's). Inside it is still VIctory: the program is `victory.exe`, the
+crates are `victory-*`, and every setting is a `VICTORY_*` environment variable, so that fixes
+from VIctory and its other forks keep coming across and every switch named in the docs and the
+research checklist means what it says.
+
+> **Zaxix/Defeat `main`** (from 2026-11-27; the repository was Zaxix/VIctory, whose links redirect): built on fxceless's gta6 base,
 > not on upstream `main`, with this fork's own changes on top, tuned for an
 > NVIDIA RTX 4070 and a Ryzen 7 5800X. On by default: the `shadow::exact` and
 > `shadow::loose` lock fixes; card-word merges (`VICTORY_MERGE_WORDS=0`

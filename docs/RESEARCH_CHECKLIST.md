@@ -11,6 +11,8 @@
 
 > **Single source of truth for what is built.** Research text below is unchanged; this table says what of it exists in code on \`main\`, what was tested where, and what each item's gate still needs. Claude keeps this section current; research edits elsewhere are welcome. A box below is ticked only when its own "Done when" gate is met: most gates need the game running on the owner's PC, so most items stay open even when their code is merged.
 >
+> **Repository renamed (2026-11-27): Zaxix/VIctory is now [Zaxix/Defeat](https://github.com/Zaxix/Defeat)**; GitHub redirects the old links, so the URLs below still work. Only the repository and the README's name changed: the program is still `victory.exe`, the crates `victory-*`, and every switch `VICTORY_*`.
+>
 > **Legend:** ✅ gate met · 🟢 on \`main\`, built and unit-tested on the owner's PC, needs an in-game run · 🟡 partial or research-only · 🔵 already in the gta6 base, nothing to port · ⬜ not started · 🎮 needs the game on the owner's PC.
 >
 > **Windows record on the owner's PC (Ryzen 7 5800X, RTX 4070):** release build OK at \`5628dc0\` (all code below); \`cargo test -p victory-gpu --lib -- --test-threads=1\` at \`5628dc0\`: **253 passed, 0 failed, 7 ignored**; \`cargo test -p victory-shader --lib\` on the shader-licm stack: **265 passed, 0 failed** (GPU parity and validation tests on the 4070). Run victory-gpu's tests one at a time as CI does: in parallel the run at \`5628dc0\` ended in STATUS_ACCESS_VIOLATION (tests that fault on purpose meet), and passed one at a time. **No in-game run yet: the owner does not have the game data.** No FPS, stability or picture claim exists for any item.
