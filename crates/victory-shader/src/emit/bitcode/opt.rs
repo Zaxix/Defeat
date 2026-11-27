@@ -5494,6 +5494,7 @@ mod tests {
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
+                half_views: Vec::new(),
             };
             (shader, inst_count, loop_insts, elapsed)
         }
@@ -5595,6 +5596,7 @@ mod tests {
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
+                half_views: Vec::new(),
             };
             (shader, inst_count, loop_insts, elapsed)
         }
@@ -5715,6 +5717,7 @@ mod tests {
                 root_srvs: lowered.root_srvs,
                 root_uavs: lowered.root_uavs,
                 root_indexed_views: Vec::new(),
+                half_views: lowered.half_views,
             };
             (shader, elapsed)
         }
@@ -6109,6 +6112,7 @@ mod tests {
                     root_srvs: lowered.root_srvs,
                     root_uavs: lowered.root_uavs,
                     root_indexed_views: Vec::new(),
+                    half_views: lowered.half_views,
                 };
                 validate_dxil(&shader.dxil);
                 shader
@@ -6290,6 +6294,7 @@ mod tests {
                     root_srvs: lowered.root_srvs,
                     root_uavs: lowered.root_uavs,
                     root_indexed_views: Vec::new(),
+                    half_views: lowered.half_views,
                 };
                 validate_dxil(&shader.dxil);
                 shader
@@ -6579,6 +6584,7 @@ mod tests {
                     root_srvs: Vec::new(),
                     root_uavs: Vec::new(),
                     root_indexed_views: Vec::new(),
+                    half_views: Vec::new(),
                 };
                 (shader, barriers_left)
             };
@@ -6783,6 +6789,7 @@ mod tests {
                     root_srvs: lowered.root_srvs,
                     root_uavs: lowered.root_uavs,
                     root_indexed_views: Vec::new(),
+                    half_views: lowered.half_views,
                 };
                 let (_, gpu_us) =
                     dispatch_timed(&host, &wf_shader, &[0; 4], 32, 2, [4096, 1, 1], 5, 25).unwrap();
