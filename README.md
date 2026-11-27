@@ -39,6 +39,15 @@ research checklist means what it says.
 > copy-back thread, run 9's largest cost), `VICTORY_RECHECK_SOON` and, since run 11,
 > `VICTORY_LEVELS_ON_DEMAND`; each also takes its own `=0`. The 28 compute programs the RTX 4070 refused
 > (64-lane waves) are tried in the exact paired form first (`VICTORY_WAVE_PAIRS_ONLY=none`: not).
+> **After run 12 (not yet run on the owner's PC):** the four 32-lane shadow-ray programs translate (heap
+> slot addresses); `VICTORY_SETTLE_ROOM`, `VICTORY_LOOKUP_CACHE`, `VICTORY_PARALLEL_REFRESH`,
+> `VICTORY_CARD_SYNC_BATCH` and `VICTORY_REFRESH_PAGES` join the faster defaults; PlayStation pads
+> (DualShock 4, DualSense) work as gamepads (`VICTORY_SONY_PADS=0`: not); the submitting and copy-back
+> threads run above normal priority (`VICTORY_OUR_PRIORITY=0`); the copy-back's merge finds the title's
+> sent bytes by a search. **Ray tracing:** the plan is `docs/RAY_TRACING_PLAN.md`; the title's hang
+> watchdog is watched (a line every 10 s once the main thread stands still: what we were doing;
+> `VICTORY_STALL_WATCH=0` off) and `VICTORY_NO_WATCHDOG=1` keeps it from ending the run, for a first
+> test with the structure builder on; that switch now re-translates only the ~100 programs that test rays.
 > Research notes: `docs/RESEARCH_CHECKLIST.md`. Results on that PC:
 > [below](#status-on-the-owners-pc-ryzen-7-5800x--rtx-4070).
 
