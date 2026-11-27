@@ -38,6 +38,7 @@ mod fpsbox;
 mod stats;
 #[cfg(windows)]
 mod spread;
+mod fast;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;

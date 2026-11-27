@@ -1049,7 +1049,7 @@ fn heap_recheck() -> bool {
 /// repository's switch of that name, on by default there.)
 fn recheck_soon() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RECHECK_SOON").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| crate::fast::on("VICTORY_RECHECK_SOON"))
 }
 
 /// Uploads of textures picked by index looked at again in the next frame

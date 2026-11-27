@@ -3852,7 +3852,7 @@ impl Shadow {
             return 0;
         }
         crate::host::shaders_write(start + at, &title[..]);
-        if self.put_back_own(start + at, &title[..]) {
+        if self.put_back_own(start + at, &title[..], as_read.as_deref()) {
             #[cfg(feature = "diagnostics")]
             crate::backreads::stored(self.id, (self.start, self.len), start + at, n, true);
             return n;
@@ -3875,7 +3875,14 @@ impl Shadow {
     /// and is reported at a later asking, which every copy then takes,
     /// this one too. False with nothing done if the switch is off or the
     /// memory cannot be written that way (the caller writes as before).
-    fn put_back_own(&self, at: usize, bytes: &[u8]) -> bool {
+    ///
+    /// `read`: the stretch as the merge read it. With it (and
+    /// [`merge_words_on`]) only the 4-byte words the merge changed are
+    /// stored, as [`write_merged`] does the old way: the whole stretch put
+    /// back the title's own bytes in between with the values read before,
+    /// undoing a title write that landed in between. Through our own view
+    /// each run is a plain copy, not a call into the kernel.
+    fn put_back_own(&self, at: usize, bytes: &[u8], read: Option<&[u8]>) -> bool {
         /// Since the start: stretches and bytes stored this way, pages
         /// noted current for their copy, stretches written the old way;
         /// and with `VICTORY_BACK_OWN_CHECK=1`: stores the title's own
@@ -3889,14 +3896,23 @@ impl Shadow {
         if !crate::inplace::back_own() {
             return false;
         }
-        let Some(shown) = crate::inplace::write_own(at, bytes) else {
+        let runs: Option<Vec<(usize, usize)>> = read.filter(|_| merge_words_on()).map(|read| {
+            let mut runs = Vec::new();
+            word_runs(at, read, bytes, |off, len| runs.push((off, len)));
+            runs
+        });
+        let Some(shown) = crate::inplace::write_own(at, bytes, runs.as_deref()) else {
             OWN_WRITES[3].fetch_add(1, Ordering::Relaxed);
             return false;
         };
         if check {
             // The title's own address must show what went in through ours.
             let mut back = vec![0u8; bytes.len()];
-            if crate::host::read_into(at as *const u8, &mut back) && back != bytes {
+            let astray = |back: &[u8]| match &runs {
+                Some(runs) => runs.iter().any(|&(off, len)| back[off..off + len] != bytes[off..off + len]),
+                None => back != bytes,
+            };
+            if crate::host::read_into(at as *const u8, &mut back) && astray(&back) {
                 OWN_WRITES[4].fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -4921,7 +4937,7 @@ impl Shadow {
             return 0;
         }
         crate::host::shaders_write(start + at, &title[..]);
-        if self.put_back_own(start + at, &title[..]) {
+        if self.put_back_own(start + at, &title[..], as_read.as_deref()) {
             #[cfg(feature = "diagnostics")]
             crate::backreads::stored(self.id, (self.start, self.len), start + at, n, true);
             return n;

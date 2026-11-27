@@ -261,8 +261,21 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = translate_listed;
     if fresh(container) {
         let hash = blake3::hash(container).to_hex();
-        eprintln!("SHADER-FRESH {} translating anew (VICTORY_SHADER_FRESH)", &hash.as_str()[..16]);
-        return translate(container);
+        // One at a time, so that the translator's diagnostic lines
+        // (`VICTORY_WAVE_WHY`, `VICTORY_DESC_WHY`) of one shader sit between
+        // its two lines here: in run 9 several threads translated at once
+        // and their lines interleaved (R51). (The translator's own crate is
+        // left alone: an edit to it misses every cached translation.)
+        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let short = &hash.as_str()[..16];
+        eprintln!("SHADER-FRESH {short} translating anew (VICTORY_SHADER_FRESH)");
+        let made = translate(container);
+        match &made {
+            Ok(_) => eprintln!("SHADER-FRESH {short} done: translated"),
+            Err(e) => eprintln!("SHADER-FRESH {short} done: {e}"),
+        }
+        return made;
     }
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),

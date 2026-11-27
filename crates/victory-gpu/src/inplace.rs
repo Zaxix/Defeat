@@ -714,6 +714,7 @@ pub(crate) fn back_own() -> bool {
     match *MODE.get_or_init(|| match std::env::var("VICTORY_BACK_OWN_VIEW").as_deref() {
         Ok("1") => 1,
         Ok("alt") => 2,
+        Err(_) if crate::fast::fast() => 1,
         _ => 0,
     }) {
         0 => false,
@@ -752,7 +753,8 @@ static OWN: Mutex<Option<std::collections::HashMap<usize, Option<Own>>>> = Mutex
 /// title view that shows it (the page of `at` among them), or `None` with
 /// nothing written: not view memory, a page of very many views, the
 /// runtime changing mappings at this moment, or the host refusing.
-pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
+/// With `runs` ((offset, bytes) of `bytes`), only those are stored.
+pub(crate) fn write_own(at: usize, bytes: &[u8], runs: Option<&[(usize, usize)]>) -> Option<Vec<usize>> {
     if bytes.is_empty() || at / K64 != (at + bytes.len() - 1) / K64 {
         return None;
     }
@@ -820,9 +822,19 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
         }
         view.committed[block / 64] |= 1u64 << (block % 64);
     }
-    // SAFETY: committed bytes inside our own view; the source is the
-    // caller's slice.
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (view.base + offset as usize) as *mut u8, bytes.len()) };
+    let to = view.base + offset as usize;
+    match runs {
+        Some(runs) => {
+            for &(off, len) in runs {
+                debug_assert!(off + len <= bytes.len());
+                // SAFETY: as below; every run lies inside `bytes`.
+                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr().add(off), (to + off) as *mut u8, len) };
+            }
+        }
+        // SAFETY: committed bytes inside our own view; the source is the
+        // caller's slice.
+        None => unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), to as *mut u8, bytes.len()) },
+    }
     Some(shown)
 }
 
