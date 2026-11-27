@@ -154,8 +154,9 @@ fn fresh(c: &[u8]) -> bool {
     listed_pair_hash(hash.as_str(), list) || (pairs_by_default() && listed_pair_hash(hash.as_str(), pairs_list()))
 }
 
-/// The compute programs the owner's RTX 4070 refused in runs 5-11, every
-/// one asking for 64-lane waves (the card runs 32): the paired form
+/// The compute programs the owner's RTX 4070 refused in runs 10 and 11 (28,
+/// the same in both), every one asking for 64-lane waves (the card runs
+/// 32); the water's two are 5dc3b25986622949 and 6f225b641c5b0708: the paired form
 /// (`victory_shader::emit::with_wave_pairs`, pull request #854 with the
 /// gta6 base's exact reductions) is tried for them first by default. It
 /// runs a console wave of 64 lanes as one host wave of 32 lanes, each
@@ -164,22 +165,37 @@ fn fresh(c: &[u8]) -> bool {
 /// `WAVE64-PAIRS-ONLY refused`) the usual forms follow, as before. The
 /// base made the water's two programs (the last two) right this way, with
 /// `VICTORY_WAVE_PAIRS_FP32=non-ieee-rne-ftz` for their float reductions.
-const PAIRS_BY_DEFAULT: [&str; 15] = [
+/// A list of the refused alone, by hash: the form is not tried for any
+/// program that works now (R55: not globally).
+const PAIRS_BY_DEFAULT: [&str; 28] = [
+    "02384a60fda6f2d0",
+    "18d957e62926ed3e",
+    "1d434307d981352a",
+    "22338086ea4c5364",
+    "2889c21328c69e58",
     "2da4beb386509b77",
     "369cbe906ea72764",
-    "02384a60fda6f2d0",
-    "6b82bc7d22016cb5",
-    "18d957e62926ed3e",
+    "3b02415f67c6b0d8",
     "407eca669212d400",
-    "5e3dd99e0f067aee",
-    "ae0deeafe219c15c",
     "57f1b81de55c2842",
-    "9fe711566bec0d0a",
-    "a40ae27594631121",
-    "2889c21328c69e58",
-    "888af37a584acf98",
     "5dc3b25986622949",
+    "5e3dd99e0f067aee",
+    "6832a9da15c2e584",
+    "6871d6e4b3ac9a10",
+    "6b82bc7d22016cb5",
     "6f225b641c5b0708",
+    "888af37a584acf98",
+    "926c46bab3b86bd6",
+    "98fef92f7a6d825e",
+    "9fe711566bec0d0a",
+    "a09f0c1fae2b5ca3",
+    "a10179ab7eda0dc3",
+    "a40ae27594631121",
+    "a4cb3ce527ad8569",
+    "ae0deeafe219c15c",
+    "aeac9d880daff3ba",
+    "f38f83439083b9ef",
+    "ffa3a7645374474b",
 ];
 
 /// Whether [`PAIRS_BY_DEFAULT`] is the pairs list: `VICTORY_WAVE_PAIRS_ONLY`
@@ -350,7 +366,7 @@ fn diagnostic_switches_leave_the_fingerprint_as_unset() {
 #[test]
 fn the_pairs_list_is_the_refused_programs_unless_set() {
     let default = parse_pairs(None);
-    assert_eq!(default.len(), 15);
+    assert_eq!(default.len(), 28);
     assert!(listed_pair_hash("369cbe906ea72764ffff", &default));
     assert!(listed_pair_hash("6f225b641c5b0708", &default));
     assert!(parse_pairs(Some("none")).is_empty());
