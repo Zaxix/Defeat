@@ -118,7 +118,10 @@ impl Pending {
                 tracing::warn!(hash, shaders = ?self.shaders, "pipeline not built: its shader is in VICTORY_DENY_PIPELINES");
                 return None;
             }
-            HostPipeline::new(&self.shaders, self.graphics.as_deref())
+            let started = Instant::now();
+            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            made_in(started.elapsed());
+            made
         });
     }
 
@@ -314,6 +317,54 @@ fn compute_waited(frame: u64, took: Duration) {
              (VICTORY_PIPELINE_COMPUTE_WAIT_MS)"
         );
     }
+}
+
+/// Host pipelines made since the start and the microseconds their making
+/// took (translating their shaders included), on every thread.
+static MADE_COST: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A host pipeline took `took` to make: counted, and at most every 10 s a
+/// line on the making since the last one: pipelines made and their time,
+/// how much of it was translating shaders (from the shader cache, or
+/// translated anew), the rest being the host's pipeline creation (the
+/// driver's compile, or a load from the pipeline library), and the queue.
+/// For the first world frames of a cold start, which wait on this.
+fn made_in(took: Duration) {
+    use std::sync::atomic::Ordering::Relaxed;
+    MADE_COST[0].fetch_add(1, Relaxed);
+    MADE_COST[1].fetch_add(took.as_micros() as u64, Relaxed);
+    static LAST: Mutex<Option<(Instant, [u64; 6])>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    let [hits, misses, hit_us, miss_us] = crate::shader_cache::costs();
+    let totals = [MADE_COST[0].load(Relaxed), MADE_COST[1].load(Relaxed), hits, misses, hit_us, miss_us];
+    let Some((at, before)) = *last else {
+        *last = Some((now, totals));
+        return;
+    };
+    let secs = now.duration_since(at).as_secs_f64();
+    if secs < 10.0 {
+        return;
+    }
+    *last = Some((now, totals));
+    let d: [u64; 6] = std::array::from_fn(|i| totals[i].saturating_sub(before[i]));
+    let ms = |us: u64| us as f64 / 1000.0;
+    let each = |us: u64, n: u64| if n == 0 { 0.0 } else { ms(us) / n as f64 };
+    let translating = d[4] + d[5];
+    tracing::info!(
+        "pipelines made in the last {secs:.0} s: {} ({:.1} a second), {:.0} ms each on average on all threads; of their time {:.0} % \
+         translating shaders ({} from the shader cache at {:.1} ms each, {} translated anew at {:.0} ms each), the rest the host's \
+         pipeline creation (the driver, or the pipeline library); {} queued now",
+        d[0],
+        d[0] as f64 / secs,
+        each(d[1], d[0]),
+        if d[1] == 0 { 0.0 } else { 100.0 * translating as f64 / d[1] as f64 },
+        d[2],
+        each(d[4], d[2]),
+        d[3],
+        each(d[5], d[3]),
+        WAITING.load(Relaxed)
+    );
 }
 
 /// Pipelines made again for the formats bound at a draw, since the start.

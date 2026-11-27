@@ -21,6 +21,15 @@ use victory_shader::{HwStage, RootType};
 static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
+/// Microseconds spent on [`HITS`] and on [`MISSES`] (reading the entry, or
+/// translating and writing it), for `crate::pipeline::make`'s line.
+static HIT_US: AtomicU64 = AtomicU64::new(0);
+static MISS_US: AtomicU64 = AtomicU64::new(0);
+
+/// Cache hits and misses since the start, and the microseconds each took.
+pub(crate) fn costs() -> [u64; 4] {
+    [&HITS, &MISSES, &HIT_US, &MISS_US].map(|c| c.load(Ordering::Relaxed))
+}
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
@@ -221,6 +230,7 @@ fn cached(
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
+    let started = std::time::Instant::now();
     let input = [&build[..], container].concat();
     let converter = Translate {
         translate,
@@ -231,20 +241,23 @@ fn cached(
             .get_or_convert(&converter, &input)
             .map_err(|e| format!("{e:#}"))?;
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
-            let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
-                (&MISSES, "translated and cached")
+            let (counter, time, what) = if converter.ran.load(Ordering::Relaxed) {
+                (&MISSES, &MISS_US, "translated and cached")
             } else {
-                (&HITS, "from the cache")
+                (&HITS, &HIT_US, "from the cache")
             };
             counter.fetch_add(1, Ordering::Relaxed);
+            time.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             tracing::debug!(path = %path.display(), "shader {what}");
             return Ok(shader);
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
         let _ = std::fs::remove_file(&path);
     }
+    let done = (converter.translate)(container);
     MISSES.fetch_add(1, Ordering::Relaxed);
-    (converter.translate)(container)
+    MISS_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    done
 }
 
 const MAGIC: &[u8; 4] = b"VSH1";
