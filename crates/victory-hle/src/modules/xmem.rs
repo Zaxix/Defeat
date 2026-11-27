@@ -134,7 +134,11 @@ fn virtual_alloc(
     let placeholder = kind & PAGES_64K == PAGES_64K && kind & MEM_COMMIT == 0;
     if placeholder {
         if kind & MEM_REPLACE_PLACEHOLDER != 0 {
-            // Part of a placeholder the title split: it stays one.
+            // Part of a placeholder the title split: it stays one. The title
+            // gives each part its own GPU access here (this title's pool
+            // set-up splits one reservation into read-only, execute-read and
+            // read-write parts), so it is recorded all the same.
+            victory_gpu::title_memory_gpu_access(base as usize, size, console_protect);
             return base;
         }
         protect = PAGE_NOACCESS;
