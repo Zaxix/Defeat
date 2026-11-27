@@ -17,7 +17,6 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
@@ -445,7 +444,16 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        // One a logical processor (16 on a Ryzen 7 5800X), unless
+        // `VICTORY_DSTORAGE_WORKERS` says how many (1 to 64): for a test of
+        // fewer next to the title's threads and the pipeline workers
+        // (research checklist R31). The order requests run in and their
+        // statuses are the same with any number.
+        let workers = std::env::var("VICTORY_DSTORAGE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(1, 64))
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
@@ -454,7 +462,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     .is_ok()
             })
             .count();
-        tracing::info!(workers = started, "dstorage: workers");
+        tracing::info!(workers = started, asked = workers, "dstorage: workers (VICTORY_DSTORAGE_WORKERS)");
     });
     Some(scheduler)
 }
@@ -988,7 +996,66 @@ extern "system" fn close(this: QueueRef) {
 }
 
 /// Reads, inflates and/or unpacks, and writes one request.
+/// Buffers a worker keeps between requests: the source read from the file,
+/// zlib's output ahead of BCPack, BCPack's symbols, and a plain read's
+/// bounce. A fresh `vec![0; n]` a request asked the system for new zeroed
+/// pages each time (at these sizes the allocator's own: one fault a page,
+/// and the zeroing) and gave them back after; up to [`scratch_keep`] bytes
+/// each are kept now. A buffer is filled to the length a request uses
+/// before anything reads it (a short file read fails the request), so it
+/// is never zeroed again.
+#[derive(Default)]
+struct Scratch {
+    source: Vec<u8>,
+    packed: Vec<u8>,
+    records: Vec<u8>,
+    bounce: Vec<u8>,
+}
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::default();
+}
+
+/// The most bytes of each [`Scratch`] buffer a worker keeps after a request
+/// (`VICTORY_DSTORAGE_SCRATCH_MB`, 16 by default; 0 keeps none, as before):
+/// with the 16 workers of a 16-thread CPU at most 1 GiB in all, and in
+/// practice the requests' own sizes.
+fn scratch_keep() -> usize {
+    static KEEP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *KEEP.get_or_init(|| {
+        std::env::var("VICTORY_DSTORAGE_SCRATCH_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(16) << 20
+    })
+}
+
+/// `buf`'s first `n` bytes, grown to them if shorter (what lies there is
+/// whatever the last request left).
+fn sized(buf: &mut Vec<u8>, n: usize) -> &mut [u8] {
+    if buf.len() < n {
+        buf.resize(n, 0);
+    }
+    &mut buf[..n]
+}
+
+/// Lets go of the buffers past [`scratch_keep`].
+fn trim(scratch: &mut Scratch) {
+    let keep = scratch_keep();
+    for buf in [&mut scratch.source, &mut scratch.packed, &mut scratch.records, &mut scratch.bounce] {
+        if buf.capacity() > keep {
+            *buf = Vec::new();
+        }
+    }
+}
+
 fn execute(request: &Request) -> Result<(), HRESULT> {
+    SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        let done = execute_with(request, &mut scratch);
+        trim(&mut scratch);
+        done
+    })
+}
+
+fn execute_with(request: &Request, scratch: &mut Scratch) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -1030,29 +1097,29 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             if !bounce {
                 return read_into(request, out).map(|()| size);
             }
-            let mut data = vec![0; size];
-            read_into(request, &mut data)?;
-            out.copy_from_slice(&data);
+            let data = sized(&mut scratch.bounce, size);
+            read_into(request, data)?;
+            out.copy_from_slice(data);
             Ok(size)
         })
         .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    let Scratch { source: source_buf, packed, records, .. } = scratch;
+    let source = read_source(request, source_buf).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
-    let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
+    let source: &[u8] = if bc != 0 && options & ZLIB != 0 {
+        let packed = sized(packed, request.intermediate_size as usize);
+        let n = inflate(source, packed).map_err(|hr| fail(hr, "zlib"))?;
+        &packed[..n]
     } else {
         source
     };
     into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
+        Some(tables) => bcpack::decode_into(bc, source, out, tables, records)
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+        None => inflate(source, out).map_err(|hr| fail(hr, "zlib")),
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
@@ -1150,18 +1217,17 @@ fn load_bcpack_tables() -> Result<Tables, String> {
     Tables::parse(&bytes).map_err(|e| e.to_string())
 }
 
-/// A compressed request's source: borrowed from memory, or read from the
-/// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+/// A compressed request's source: the title's memory, or read from the
+/// file into `buf` (a worker's [`Scratch`]).
+fn read_source<'a>(request: &Request, buf: &'a mut Vec<u8>) -> Result<&'a [u8], HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
-        let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
-        return Ok(Cow::Borrowed(bytes));
+        return Ok(unsafe { std::slice::from_raw_parts(request.source.cast(), size) });
     }
-    let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
-    Ok(Cow::Owned(bytes))
+    let bytes = sized(buf, size);
+    read_into(request, bytes)?;
+    Ok(bytes)
 }
 
 /// Nanoseconds workers spent reading files, for the debug summary.

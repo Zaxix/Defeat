@@ -462,7 +462,15 @@ fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| n.get().saturating_sub(4).clamp(4, 14));
+        // (12 on a Ryzen 7 5800X.) `VICTORY_PIPELINE_WORKERS` says how many
+        // (1 to 64) instead: for a test of fewer next to the title's threads
+        // and the storage workers (research checklist R31).
+        let workers = std::env::var("VICTORY_PIPELINE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(1, 64))
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get().saturating_sub(4).clamp(4, 14)));
+        tracing::info!(workers, "pipeline workers (VICTORY_PIPELINE_WORKERS)");
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))

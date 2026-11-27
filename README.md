@@ -14,7 +14,10 @@
 > (`VICTORY_GPU_ACCESS_COSTS=0`), and where host copies live (PC memory,
 > card memory, GPU upload heap, in place) with what each placement costs,
 > every 30 s (`VICTORY_PLACEMENT_LOOK=0`; the observing half of adaptive
-> placement: nothing moves). Research notes: `docs/RESEARCH_CHECKLIST.md`.
+> placement: nothing moves). Streaming: each DirectStorage worker keeps its
+> buffers between requests (`VICTORY_DSTORAGE_SCRATCH_MB=0` for fresh ones);
+> `VICTORY_DSTORAGE_WORKERS` and `VICTORY_PIPELINE_WORKERS` set the two pools'
+> sizes for thread-count tests (defaults unchanged: 16 and 12 on a 5800X). Research notes: `docs/RESEARCH_CHECKLIST.md`.
 > None of it has been run in the game on that PC yet.
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
