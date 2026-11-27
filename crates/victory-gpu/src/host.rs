@@ -803,7 +803,62 @@ fn second_look(budget: u64, used: u64, shared: u64) {
             pc[5],
             values[18],
         );
+        process_memory_line();
     }
+}
+
+/// The process's memory by Windows' own categories, once a minute beside
+/// the PC's line (research checklist R35): private commit (what the line
+/// above calls "private": `PagefileUsage` is the commit charge), the working
+/// set (what of the process is in RAM now) and its private part, their
+/// peaks, the page faults since the last line (soft and hard together: a
+/// fault is not a read from disk), and the system's commit against its
+/// limit. Older Windows without `PROCESS_MEMORY_COUNTERS_EX2` gives no
+/// private working set.
+fn process_memory_line() {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION, PROCESS_MEMORY_COUNTERS,
+        PROCESS_MEMORY_COUNTERS_EX2,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    static FAULTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    // SAFETY: plain data the call fills in.
+    let mut c: PROCESS_MEMORY_COUNTERS_EX2 = unsafe { std::mem::zeroed() };
+    c.cb = size_of::<PROCESS_MEMORY_COUNTERS_EX2>() as u32;
+    // SAFETY: our own process, and a structure of the size given; the
+    // smaller layout's fields lead the larger one's.
+    let ex2 = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut c).cast(), c.cb) } != 0;
+    if !ex2 {
+        c.cb = size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        // SAFETY: as above, the plain layout.
+        if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut c).cast(), c.cb) } == 0 {
+            return;
+        }
+        c.PrivateUsage = c.PagefileUsage;
+    }
+    // SAFETY: plain data the call fills in.
+    let mut p: PERFORMANCE_INFORMATION = unsafe { std::mem::zeroed() };
+    p.cb = size_of::<PERFORMANCE_INFORMATION>() as u32;
+    // SAFETY: a sized structure.
+    let system = unsafe { K32GetPerformanceInfo(&mut p, p.cb) } != 0;
+    let mb = |bytes: usize| bytes as u64 >> 20;
+    let pages = |n: usize| if system { (n as u64 * p.PageSize as u64) >> 20 } else { 0 };
+    let faults = u64::from(c.PageFaultCount);
+    let before = FAULTS.swap(faults, std::sync::atomic::Ordering::Relaxed);
+    let private_ws = if ex2 { format!("{} MB", mb(c.PrivateWorkingSetSize)) } else { "unknown (no EX2 counters)".into() };
+    tracing::info!(
+        "the process by the minute: private commit {} MB (peak {} MB), working set {} MB (peak {} MB), private working set {}, \
+         {} page faults since the last line (soft and hard); the system's commit {} MB of its limit {} MB (peak {} MB)",
+        mb(c.PrivateUsage),
+        mb(c.PeakPagefileUsage),
+        mb(c.WorkingSetSize),
+        mb(c.PeakWorkingSetSize),
+        private_ws,
+        if before == u64::MAX { "?".to_string() } else { faults.wrapping_sub(before).to_string() },
+        pages(p.CommitTotal),
+        pages(p.CommitLimit),
+        pages(p.CommitPeak),
+    );
 }
 
 /// The rows of [`SECOND_ROWS`] that are of the last [`SECONDS`] seconds,
