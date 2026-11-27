@@ -19,6 +19,7 @@
 
 | ID | State | Commits on \`main\` | What exists | Still needed for the gate |
 |---|---|---|---|---|
+| First run (2026-11-27) | 🟡 | (this merge) | **First run on the owner's PC:** title screen, menu and intro worked; on loading into the world the title's own hang watchdog crashed it (write to address 0 at image+0x23cf683) after ~30 s with no frame finished: frame 6584 translated ~820 shaders and built ~950 pipelines for the first time, compute pipelines one by one on the title's thread (\`VICTORY_PIPELINE_COMPUTE_WAIT\`, unlimited). Fix: a frame waits at most 10 s in all for new compute pipelines (\`VICTORY_PIPELINE_COMPUTE_WAIT_MS\`, 0 = no limit). Also seen while loading: texture refreshes waited 48–70 ms a frame for title memory to stop being remapped (try \`VICTORY_TEXTURE_NO_WAIT=1\`); xxh3 hashed 563 MB in 20 ms. | Second run with warm caches. |
 | R03 | ✅ | \`9ead592\` | Every experiment branch is an ancestor of \`main\`; \`main\` = fxceless gta6 base + all Claude changes + this checklist. Upstream-based \`fc093e2\` deliberately not carried (gta6 has its own \`probe_view_limit\`). | — |
 | R04 | 🟢 🎮 | \`16183bd\` | \`shadow::exact\`: lookups/inserts only under EXACT, buffers made and copies dropped outside it, pruning every 64 askings (\`VICTORY_EXACT_EVERY\`). Belobug #451's pool **not** ported. | Lock-wait and frame A/B in game. |
 | R05 | 🟢 🎮 | \`dc744db\` | \`shadow::loose\`: RwLock, windows made outside the write lock, first insert wins. | As R04. |
