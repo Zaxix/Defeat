@@ -56,6 +56,7 @@ mod host;
 #[cfg(windows)]
 mod indirect;
 pub mod gpu_access;
+mod placement;
 #[cfg(windows)]
 mod inplace;
 mod launch;
