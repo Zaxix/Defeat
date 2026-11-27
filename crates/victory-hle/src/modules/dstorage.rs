@@ -1194,11 +1194,12 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     result
 }
 
-/// `VICTORY_PAGE_WRITES_BEFORE`: `1` tells the GPU side of a write into
-/// physical pages before it as well as after ([`into_destination`]).
+/// `VICTORY_PAGE_WRITES_BEFORE`: the GPU side is told of a write into
+/// physical pages before it as well as after ([`into_destination`]); on by
+/// default, `0` tells it only after, as before.
 fn page_writes_before() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_PAGE_WRITES_BEFORE").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| std::env::var("VICTORY_PAGE_WRITES_BEFORE").map_or(true, |v| v.trim() != "0"))
 }
 
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
@@ -1238,10 +1239,10 @@ fn into_destination(
             (offset + len).div_ceil(PAGE),
         )
     };
-    // `VICTORY_PAGE_WRITES_BEFORE=1`: the addresses showing these pages are
-    // told before the write as well as after (#2503: told only after, a
-    // block guarded under it may keep the new bytes as its bytes from
-    // before). Off by default until measured.
+    // The addresses showing these pages are told before the write as well
+    // as after (#2503: told only after, a block guarded under it may keep
+    // the new bytes as its bytes from before). `VICTORY_PAGE_WRITES_BEFORE=0`
+    // turns it off.
     let before = page_writes_before();
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.

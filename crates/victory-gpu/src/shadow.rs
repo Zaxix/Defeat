@@ -1291,7 +1291,7 @@ fn merge_race_on() -> bool {
 }
 
 /// Whether a merge writes back to title memory only the 4-byte words the
-/// card changed (`VICTORY_MERGE_WORDS=1`; off by default), instead of its
+/// card changed (on by default; `VICTORY_MERGE_WORDS=0` turns it off), instead of its
 /// whole stretch from the first changed byte to the last. The whole
 /// stretch also stores the title's own bytes in between with the values
 /// the merge read, so a title write that lands between that read and the
@@ -1301,7 +1301,7 @@ fn merge_race_on() -> bool {
 /// cost: a write per run of words instead of one per stretch.
 fn merge_words_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_WORDS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_WORDS").is_none_or(|v| v != "0"))
 }
 
 /// Writes a merge's result `merged` over title memory at `address`: the
@@ -2900,7 +2900,7 @@ mod merge_tests {
 
     /// A title write that lands between a relay merge's read of title memory
     /// and its write-back: the whole stretch puts the byte back to what the
-    /// merge read; the card's words alone (`VICTORY_MERGE_WORDS=1`) leave it
+    /// merge read; the card's words alone (`VICTORY_MERGE_WORDS`, on by default) leave it
     /// as the title wrote it, and still store every word the card changed.
     #[test]
     fn words_alone_keep_a_title_write_that_lands_after_the_merge_read() {
