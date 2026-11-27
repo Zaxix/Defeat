@@ -830,7 +830,20 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    // What the driver may object to without the debug layer to
+                    // say: the wave size the program asks for (NVIDIA's waves
+                    // are 32 lanes and refuse `WaveSize(64)`) and its group.
+                    let asks = stages
+                        .first()
+                        .and_then(|(s, _)| s.translated())
+                        .and_then(|t| compute_asks(&t.host.dxil));
+                    tracing::warn!(
+                        error = %e,
+                        ?shaders,
+                        wave_size = asks.map(|a| a.wave_size()),
+                        threads = ?asks.map(|a| a.threads),
+                        "host pipeline refused"
+                    );
                     host.log_messages();
                     return None;
                 }
@@ -1974,5 +1987,100 @@ mod tests {
         let big = vec![[65_535, 1, 1]; 20];
         assert_eq!(u64::from(run(None, &big)), 16 * 65_535, "records past the budget");
         assert_eq!(((1u64 << 27) / (65_535 * 128)), 16);
+    }
+}
+
+/// What a translated compute program asks of the host, from its `PSV0`
+/// part: the wave sizes it takes (0 and `u32::MAX`: any) and its group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ComputeAsks {
+    pub wave_min: u32,
+    pub wave_max: u32,
+    pub threads: [u32; 3],
+}
+
+impl ComputeAsks {
+    /// The one wave size asked for, or 0 for any.
+    pub(crate) fn wave_size(self) -> u32 {
+        if self.wave_min == self.wave_max { self.wave_min } else { 0 }
+    }
+}
+
+/// [`ComputeAsks`] of DXBC container `dxbc`, if it has a `PSV0` part.
+pub(crate) fn compute_asks(dxbc: &[u8]) -> Option<ComputeAsks> {
+    let u32_at = |b: &[u8], at: usize| b.get(at..at + 4).map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]));
+    if dxbc.get(0..4)? != b"DXBC" {
+        return None;
+    }
+    let parts = u32_at(dxbc, 0x1c)? as usize;
+    (0..parts.min(64)).find_map(|i| {
+        let at = u32_at(dxbc, 0x20 + 4 * i)? as usize;
+        if dxbc.get(at..at + 4)? != b"PSV0" {
+            return None;
+        }
+        let data = dxbc.get(at + 8..at + 8 + u32_at(dxbc, at + 4)? as usize)?;
+        // The runtime info's size, then the info (`PSV0` version 2 and up).
+        let info = data.get(4..4 + (u32_at(data, 0)? as usize).min(data.len()))?;
+        if info.len() < 48 {
+            return None;
+        }
+        Some(ComputeAsks {
+            wave_min: u32_at(info, 16)?,
+            wave_max: u32_at(info, 20)?,
+            threads: [u32_at(info, 36)?, u32_at(info, 40)?, u32_at(info, 44)?],
+        })
+    })
+}
+
+#[cfg(test)]
+mod asks_tests {
+    use super::{ComputeAsks, compute_asks};
+
+    /// A container of `parts` as the translator lays them out.
+    fn container(parts: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
+        let mut out = b"DXBC".to_vec();
+        out.extend([0; 16]);
+        out.extend(1u16.to_le_bytes());
+        out.extend(0u16.to_le_bytes());
+        out.extend(0u32.to_le_bytes());
+        out.extend((parts.len() as u32).to_le_bytes());
+        let mut at = 0x20 + 4 * parts.len();
+        for (_, d) in parts {
+            out.extend((at as u32).to_le_bytes());
+            at += 8 + d.len();
+        }
+        for (fourcc, d) in parts {
+            out.extend(*fourcc);
+            out.extend((d.len() as u32).to_le_bytes());
+            out.extend(d);
+        }
+        out
+    }
+
+    fn psv(min: u32, max: u32, threads: [u32; 3]) -> Vec<u8> {
+        let mut info = [0u8; 48];
+        info[16..20].copy_from_slice(&min.to_le_bytes());
+        info[20..24].copy_from_slice(&max.to_le_bytes());
+        info[24] = 5;
+        for (k, n) in threads.into_iter().enumerate() {
+            info[36 + 4 * k..40 + 4 * k].copy_from_slice(&n.to_le_bytes());
+        }
+        let mut out = 48u32.to_le_bytes().to_vec();
+        out.extend(info);
+        out.extend(0u32.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn a_compute_programs_wave_and_group_are_read_from_its_psv() {
+        let c = container(&[(b"SFI0", vec![0; 8]), (b"PSV0", psv(64, 64, [64, 1, 1])), (b"DXIL", vec![1, 2, 3])]);
+        let asks = compute_asks(&c).expect("a PSV0 part");
+        assert_eq!(asks, ComputeAsks { wave_min: 64, wave_max: 64, threads: [64, 1, 1] });
+        assert_eq!(asks.wave_size(), 64);
+        let any = compute_asks(&container(&[(b"PSV0", psv(0, u32::MAX, [256, 1, 1]))])).expect("a PSV0 part");
+        assert_eq!(any.wave_size(), 0);
+        assert_eq!(compute_asks(&container(&[(b"DXIL", vec![0; 4])])), None);
+        assert_eq!(compute_asks(b"not a container"), None);
+        assert_eq!(compute_asks(&c[..40]), None, "cut short");
     }
 }

@@ -497,37 +497,46 @@ pub(crate) fn early(p: &Arc<Pending>) {
     if super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
-    } else if p.graphics.is_none() && compute_early() {
+    } else if p.graphics.is_none() && spare_most() > 0 {
         COMPUTE_EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p, EARLY);
+        start(p, SPARE);
     }
 }
 
 /// Compute pipelines started at their creation that no earlier run used.
 pub(crate) static COMPUTE_EARLY: AtomicU64 = AtomicU64::new(0);
 
-/// Whether a compute pipeline no earlier run used is started at its
-/// creation (behind the queue of requested ones, as the library's are),
-/// not at its first dispatch.
+/// How many workers at once may make compute pipelines no earlier run
+/// used, started at their creation, not at their first dispatch: behind
+/// everything requested and everything an earlier run used, on at most
+/// this many workers (`VICTORY_PIPELINE_COMPUTE_EARLY`: a number, 0 at
+/// first dispatch only; default 2).
 ///
 /// Why: the title creates its compute pipelines while it loads and runs
-/// many of them first in a scene's opening frames, where each was made
-/// then, one after another, while the frame waited. In run 4 on the
-/// owner's PC (RTX 4070, 5800X) the first cutscene frames waited 13.6 and
-/// 14.6 s for four compute pipelines created a minute before (programs of
-/// 12 to 66 KB): the 12 workers had been idle. Compute pipelines are the
-/// fewer and the larger (835 of the run's 2,229 first binds; graphics
-/// ones stay started at first use, being many more and cheap). The made
-/// ones go to the pipeline library as any other.
-/// On by default; `VICTORY_PIPELINE_COMPUTE_EARLY=0`: at first dispatch,
-/// as before.
-fn compute_early() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_PIPELINE_COMPUTE_EARLY").is_none_or(|v| v != "0");
-        tracing::info!(on, "compute pipelines started at their creation (VICTORY_PIPELINE_COMPUTE_EARLY)");
-        on
+/// many of them first in a scene's opening frames. Made only then, one
+/// after another (run 4 on the owner's RTX 4070 / 5800X), the first
+/// cutscene frames waited 13.6 and 14.6 s for four of them. Started at
+/// creation on every worker (run 5, c8bdf90), ~2,900 were queued while
+/// loading, most never used: the 12 workers compiled them for the whole
+/// run at 1 to 8 s each (the driver; the CPU at 99 %), 1,014 were still
+/// queued when it ended, and everything else on the CPU slowed with them.
+/// On two workers they are made in the background over a few runs; the
+/// made ones go to the pipeline library, whence later runs load them.
+fn spare_most() -> usize {
+    static MOST: OnceLock<usize> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        let most = spare_most_of(std::env::var("VICTORY_PIPELINE_COMPUTE_EARLY").ok().as_deref());
+        tracing::info!(most, "workers for compute pipelines started at their creation (VICTORY_PIPELINE_COMPUTE_EARLY)");
+        most
     })
+}
+
+/// [`spare_most`] from the switch's value.
+fn spare_most_of(v: Option<&str>) -> usize {
+    match v.map(str::trim) {
+        None | Some("") => 2,
+        Some(v) => v.parse::<usize>().map_or(2, |n| n.min(64)),
+    }
 }
 
 /// Whether the frame's budget is one for all threads together: a thread
@@ -599,20 +608,28 @@ fn wait(p: &Pending, frame: u64) {
 }
 
 const NOT_QUEUED: u8 = 0;
-const EARLY: u8 = 1;
-const REQUESTED: u8 = 2;
-const MAKING: u8 = 3;
+/// Queued as spare work: a compute pipeline no earlier run used
+/// ([`spare_most`]).
+const SPARE: u8 = 1;
+const EARLY: u8 = 2;
+const REQUESTED: u8 = 3;
+const MAKING: u8 = 4;
 
 struct Queue {
+    spare: VecDeque<Arc<Pending>>,
     early: VecDeque<Arc<Pending>>,
     requested: VecDeque<Arc<Pending>>,
+    /// Spare pipelines workers are making now.
+    spare_busy: usize,
 }
 
 impl Queue {
     const fn new() -> Self {
         Self {
+            spare: VecDeque::new(),
             early: VecDeque::new(),
             requested: VecDeque::new(),
+            spare_busy: 0,
         }
     }
 
@@ -624,10 +641,10 @@ impl Queue {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED {
-            self.requested.push_back(p.clone());
-        } else {
-            self.early.push_back(p.clone());
+        match priority {
+            REQUESTED => self.requested.push_back(p.clone()),
+            EARLY => self.early.push_back(p.clone()),
+            _ => self.spare.push_back(p.clone()),
         }
         Some(prev == NOT_QUEUED)
     }
@@ -646,14 +663,30 @@ impl Queue {
         }
     }
 
-    fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self.requested.pop_front().or_else(|| {
-            // An early entry can have been promoted and claimed already.
-            std::iter::from_fn(|| self.early.pop_front())
-                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
-        })?;
+    /// The next pipeline to make, and whether it is spare work (which the
+    /// worker gives back with [`Queue::spare_done`]); spare work only while
+    /// fewer than `spare_most` workers make it.
+    fn pop(&mut self, spare_most: usize) -> Option<(Arc<Pending>, bool)> {
+        // An early or spare entry can have been promoted and claimed already.
+        let still = |state: u8| move |p: &Arc<Pending>| p.queue_state.load(Ordering::Relaxed) == state;
+        let (p, spare) = if let Some(p) = self.requested.pop_front() {
+            (p, false)
+        } else if let Some(p) = std::iter::from_fn(|| self.early.pop_front()).find(still(EARLY)) {
+            (p, false)
+        } else if self.spare_busy < spare_most
+            && let Some(p) = std::iter::from_fn(|| self.spare.pop_front()).find(still(SPARE))
+        {
+            self.spare_busy += 1;
+            (p, true)
+        } else {
+            return None;
+        };
         p.queue_state.store(MAKING, Ordering::Relaxed);
-        Some(p)
+        Some((p, spare))
+    }
+
+    fn spare_done(&mut self) {
+        self.spare_busy = self.spare_busy.saturating_sub(1);
     }
 }
 
@@ -681,11 +714,12 @@ fn start(p: &Arc<Pending>, priority: u8) {
     }
 }
 
-fn next() -> Arc<Pending> {
+fn next() -> (Arc<Pending>, bool) {
+    let spare_most = spare_most();
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(p) = queue.pop() {
-            return p;
+        if let Some(next) = queue.pop(spare_most) {
+            return next;
         }
         queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
     }
@@ -711,7 +745,13 @@ fn workers() -> bool {
                 .name(format!("victory-pipelines-{i}"))
                 .spawn(|| {
                     loop {
-                        next().make();
+                        let (p, spare) = next();
+                        p.make();
+                        if spare {
+                            QUEUE.lock().unwrap_or_else(|e| e.into_inner()).spare_done();
+                            // A worker waiting while the spare limit held.
+                            AVAILABLE.notify_one();
+                        }
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
@@ -780,7 +820,7 @@ mod tests {
         queue.hurry(&c);
         let order: Vec<_> = queue.requested.iter().map(Arc::as_ptr).collect();
         assert_eq!(order, [Arc::as_ptr(&c), Arc::as_ptr(&a), Arc::as_ptr(&b)]);
-        let taken = queue.pop().expect("one queued");
+        let (taken, _) = queue.pop(0).expect("one queued");
         assert!(Arc::ptr_eq(&taken, &c));
         queue.hurry(&c);
         assert_eq!(queue.requested.len(), 2, "a taken pipeline is not queued again");
@@ -879,10 +919,46 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
 
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &requested));
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &promoted));
+        assert!(Arc::ptr_eq(&queue.pop(0).unwrap().0, &requested));
+        assert!(Arc::ptr_eq(&queue.pop(0).unwrap().0, &promoted));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
-        assert!(queue.pop().is_none());
+        assert!(Arc::ptr_eq(&queue.pop(0).unwrap().0, &earlier));
+        assert!(queue.pop(0).is_none());
+    }
+
+    #[test]
+    fn spare_pipelines_go_last_on_at_most_so_many_workers() {
+        let [s1, s2, s3, early, requested] = [(); 5].map(|()| Arc::new(Pending::new(Vec::new(), None)));
+        let mut queue = Queue::new();
+        for s in [&s1, &s2, &s3] {
+            assert_eq!(queue.push(s, SPARE), Some(true));
+        }
+        assert_eq!(queue.push(&early, EARLY), Some(true));
+        assert_eq!(queue.push(&requested, REQUESTED), Some(true));
+        let take = |queue: &mut Queue| queue.pop(2).map(|(p, spare)| (Arc::as_ptr(&p), spare));
+        assert_eq!(take(&mut queue), Some((Arc::as_ptr(&requested), false)));
+        assert_eq!(take(&mut queue), Some((Arc::as_ptr(&early), false)));
+        assert_eq!(take(&mut queue), Some((Arc::as_ptr(&s1), true)));
+        assert_eq!(take(&mut queue), Some((Arc::as_ptr(&s2), true)));
+        assert_eq!(take(&mut queue), None, "two spare ones at most at once");
+        queue.spare_done();
+        assert_eq!(take(&mut queue), Some((Arc::as_ptr(&s3), true)));
+        // A spare one asked for by a dispatch is requested work, once.
+        let s4 = Arc::new(Pending::new(Vec::new(), None));
+        assert_eq!(queue.push(&s4, SPARE), Some(true));
+        assert_eq!(queue.push(&s4, REQUESTED), Some(false));
+        assert_eq!(take(&mut queue), Some((Arc::as_ptr(&s4), false)));
+        queue.spare_done();
+        queue.spare_done();
+        assert_eq!(take(&mut queue), None, "its spare entry is not made again");
+        assert!(queue.spare.is_empty());
+    }
+
+    #[test]
+    fn the_spare_worker_count_reads_its_switch() {
+        assert_eq!(spare_most_of(None), 2);
+        assert_eq!(spare_most_of(Some("0")), 0);
+        assert_eq!(spare_most_of(Some(" 4 ")), 4);
+        assert_eq!(spare_most_of(Some("on")), 2);
     }
 }
