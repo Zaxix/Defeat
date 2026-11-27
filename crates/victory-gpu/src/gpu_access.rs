@@ -21,7 +21,7 @@
 //! memory that is not known to be the same allocation.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const PAGE_GRAPHICS_NOACCESS: u32 = 0x0800;
@@ -145,11 +145,9 @@ impl Ranges {
     }
 }
 
-static RANGES: Mutex<Ranges> = Mutex::new(Ranges(BTreeMap::new()));
-
-fn ranges() -> std::sync::MutexGuard<'static, Ranges> {
-    RANGES.lock().unwrap_or_else(|e| e.into_inner())
-}
+/// Read far more often than written (lookups from the submission and list
+/// threads, writes only at allocations): a read-write lock.
+static RANGES: RwLock<Ranges> = RwLock::new(Ranges(BTreeMap::new()));
 
 /// The title allocated or committed `[at, at + len)` with the console
 /// protection `protect` (its own value, before `xmem` cleans it for the
@@ -157,14 +155,55 @@ fn ranges() -> std::sync::MutexGuard<'static, Ranges> {
 pub fn title_memory_gpu_access(at: usize, len: usize, protect: u32) {
     let access = from_protect(protect);
     SEEN[access.index()].fetch_add(1, Ordering::Relaxed);
-    ranges().set(at, at.saturating_add(len), access, protect);
+    RANGES.write().unwrap_or_else(|e| e.into_inner()).set(at, at.saturating_add(len), access, protect);
 }
 
 /// What the title said the GPU may do over `[at, at + len)`: the most
 /// permissive of what covers it, [`GpuAccess::Unstated`] where nothing
 /// does. Not used to skip work yet (see the module's notes).
 pub fn gpu_access(at: usize, len: usize) -> GpuAccess {
-    ranges().get(at, at.saturating_add(len))
+    RANGES.read().unwrap_or_else(|e| e.into_inner()).get(at, at.saturating_add(len))
+}
+
+/// The GPU side's work over title memory that the title's flags could
+/// spare, counted by the access of the memory it lands on: what tells, in a
+/// run, which use of the flags is worth making.
+#[derive(Clone, Copy, Debug)]
+pub enum Cost {
+    /// Ranges a list asks to bring up to date before the GPU reads them
+    /// (`Shadow::refresh`; asked, not the bytes found changed).
+    Refreshed = 0,
+    /// Ranges a submission's shaders may write, on copies in the card's
+    /// memory: what the card hashes before and compares after.
+    Declared = 1,
+    /// Bytes found written by the GPU and stored back into title memory.
+    WrittenBack = 2,
+}
+
+impl Cost {
+    const ALL: [Cost; 3] = [Cost::Refreshed, Cost::Declared, Cost::WrittenBack];
+
+    fn name(self) -> &'static str {
+        match self {
+            Cost::Refreshed => "refreshed",
+            Cost::Declared => "declared written",
+            Cost::WrittenBack => "written back",
+        }
+    }
+}
+
+/// Bytes of each [`Cost`] by [`GpuAccess`], since the last census line.
+static COSTS: [[AtomicU64; 4]; 3] = [const { [const { AtomicU64::new(0) }; 4] }; 3];
+
+/// `len` bytes of `cost` at title memory `at`, counted by its access.
+/// `VICTORY_GPU_ACCESS_COSTS=0` turns the counting off.
+pub fn count(cost: Cost, at: usize, len: usize) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if len == 0 || !*ON.get_or_init(|| std::env::var_os("VICTORY_GPU_ACCESS_COSTS").is_none_or(|v| v != "0")) {
+        return;
+    }
+    let access = gpu_access(at, len);
+    COSTS[cost as usize][access.index()].fetch_add(len as u64, Ordering::Relaxed);
 }
 
 /// Calls of each kind so far, and GPU writes found where the title said
@@ -177,7 +216,11 @@ static WRITES_AGAINST: AtomicU64 = AtomicU64::new(0);
 /// where the title said the GPU does not write there: the check that has
 /// to come out at zero before the flags may be trusted to skip work.
 pub fn note_gpu_write(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
     let access = gpu_access(at, len);
+    COSTS[Cost::WrittenBack as usize][access.index()].fetch_add(len as u64, Ordering::Relaxed);
     if matches!(access, GpuAccess::None | GpuAccess::Read) {
         let n = WRITES_AGAINST.fetch_add(1, Ordering::Relaxed);
         if n < 16 {
@@ -204,7 +247,7 @@ pub(crate) fn tick() {
         return;
     }
     *last = Some((now, calls));
-    let census = ranges().census();
+    let census = RANGES.read().unwrap_or_else(|e| e.into_inner()).census();
     let line: Vec<String> = GpuAccess::ALL
         .iter()
         .map(|&a| {
@@ -217,6 +260,18 @@ pub(crate) fn tick() {
         "GPU access by the title's own flags: {}",
         line.join(", ")
     );
+    // What the GPU side did over each kind since the last line.
+    let costs: Vec<String> = Cost::ALL
+        .iter()
+        .map(|&c| {
+            let by: Vec<String> = GpuAccess::ALL
+                .iter()
+                .map(|&a| format!("{} {:.1} MiB", a.name(), COSTS[c as usize][a.index()].swap(0, Ordering::Relaxed) as f64 / (1 << 20) as f64))
+                .collect();
+            format!("{}: {}", c.name(), by.join(" / "))
+        })
+        .collect();
+    tracing::info!("GPU side's work by the title's flags since the last line: {}", costs.join("; "));
 }
 
 #[cfg(test)]

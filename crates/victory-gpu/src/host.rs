@@ -5946,6 +5946,12 @@ impl Host {
                 second.sent_up(&self.queue, sent_as);
             }
         };
+        // What the title's flags say of the memory shaders may write here.
+        for (_, ranges) in &declared {
+            for &(from, to) in ranges {
+                crate::gpu_access::count(crate::gpu_access::Cost::Declared, from, to.saturating_sub(from));
+            }
+        }
         if declared.is_empty() && dirty.is_empty() && patches.is_empty() {
             numbered();
             return None;

@@ -1312,9 +1312,13 @@ fn write_merged(address: usize, read: Option<&[u8]>, merged: &[u8]) {
         Some(read) if merge_words_on() => {
             word_runs(address, read, merged, |off, len| {
                 crate::host::write_mapped((address + off) as *mut u8, merged[off..].as_ptr(), len);
+                crate::gpu_access::note_gpu_write(address + off, len);
             });
         }
-        _ => crate::host::write_mapped(address as *mut u8, merged.as_ptr(), merged.len()),
+        _ => {
+            crate::host::write_mapped(address as *mut u8, merged.as_ptr(), merged.len());
+            crate::gpu_access::note_gpu_write(address, merged.len());
+        }
     }
 }
 
@@ -3399,6 +3403,7 @@ impl Shadow {
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         let len = len.min(self.start + self.len - address);
+        crate::gpu_access::count(crate::gpu_access::Cost::Refreshed, address as usize, len as usize);
         list.defer_refresh(self, address as usize, len as usize);
     }
 
@@ -3658,6 +3663,7 @@ impl Shadow {
                 // there since stays.
                 for &(off, len) in &runs {
                     crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
+                    crate::gpu_access::note_gpu_write(start + at + off, len);
                     written += len;
                 }
             }

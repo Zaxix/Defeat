@@ -94,7 +94,7 @@ mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
-pub use gpu_access::{note_gpu_write, title_memory_gpu_access};
+pub use gpu_access::{Cost as GpuAccessCost, note_gpu_write, title_memory_gpu_access};
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
