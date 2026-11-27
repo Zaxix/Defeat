@@ -371,6 +371,46 @@ fn changed_list() -> bool {
     }
 }
 
+/// Whether a refresh of watched memory takes the whole 64 KiB pages its
+/// range touches (`VICTORY_REFRESH_PAGES=1`; off by default). A page only
+/// partly in a refreshed range is copied in part and stays stale for the
+/// rest (`Shadow::copy_stale`), so every later refresh that reaches it
+/// copies it again, written or not; taken whole, it is copied again only
+/// once the title writes it. After upstream VIctory pull request #3289
+/// (RTX 4060 Ti: 550-690 MB copied a frame -> 73-120, frame 700-730 ms ->
+/// 380-445; R55). Ranges shaders may be writing (`Shadow::pending`) are
+/// still left out of the widened range, as of any range; this tree has no
+/// "kept writes" (shader bytes the copy holds and title memory never
+/// gets), which the pull request also stops short of. Run 11 copied about
+/// 150 MB a frame in 40 ms (median).
+fn refresh_pages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_REFRESH_PAGES").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("refreshes of watched title memory take whole 64 KiB pages (VICTORY_REFRESH_PAGES=1)");
+        }
+        on
+    })
+}
+
+/// `[from, to)` grown to the 64 KiB pages it touches, cut to the buffer
+/// `[start, end)`.
+fn whole_pages(from: usize, to: usize, start: usize, end: usize) -> (usize, usize) {
+    ((from / PAGE * PAGE).max(start), to.div_ceil(PAGE).saturating_mul(PAGE).min(end))
+}
+
+#[cfg(test)]
+#[test]
+fn a_refresh_grows_to_its_pages_within_the_buffer() {
+    let p = PAGE;
+    assert_eq!(whole_pages(p + 64, p + 80, 0, 8 * p), (p, 2 * p));
+    assert_eq!(whole_pages(p + 64, 3 * p + 1, 0, 8 * p), (p, 4 * p));
+    // The buffer's own edges stay.
+    assert_eq!(whole_pages(p + 64, p + 80, p + 32, p + 100), (p + 32, p + 100));
+    assert_eq!(whole_pages(2 * p, 3 * p, 0, 8 * p), (2 * p, 3 * p));
+}
+
 /// Whether [`CHANGED`] is kept at all (the switch is set to `1` or `alt`).
 fn changed_kept() -> bool {
     static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -4326,6 +4366,13 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        // Whole pages, for watched memory (`VICTORY_REFRESH_PAGES=1`): the
+        // ranges shaders may be writing are still left out, below.
+        let (from, to) = if refresh_pages() && self.watched.load(Ordering::Relaxed) == 1 {
+            whole_pages(from, to, start, end)
+        } else {
+            (from, to)
+        };
         let mut busy: Vec<(usize, usize)> = self
             .pending
             .lock()
