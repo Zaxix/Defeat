@@ -5458,6 +5458,17 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 #[allow(clippy::type_complexity)]
 static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
 
+/// The asking at which [`exact`] next looks for idle copies to let go
+/// (`VICTORY_EXACT_EVERY=1`: at every asking that finds none, as before).
+static EXACT_PRUNE: AtomicU64 = AtomicU64::new(0);
+
+/// Askings between [`exact`]'s looks for idle copies: 64 unless
+/// `VICTORY_EXACT_EVERY` says otherwise (at least 1).
+fn exact_every() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_EXACT_EVERY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(64).max(1))
+}
+
 /// Since the last frame line: askings for such copies, and copies made.
 static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
@@ -5486,28 +5497,57 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
-    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
-    *tick += 1;
-    let now = *tick;
-    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
-        *used = now;
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        return Some(shadow.clone());
-    }
-    if map.len() >= MANY {
-        // Held by the map alone (no list), its buffer by the copy alone (no
-        // slot shows it), and not asked for lately.
-        map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
-        });
-    }
+    // The lock is held only to look and to insert: making the host buffer
+    // (`CreateCommittedResource`) and letting go of idle copies (their
+    // buffers' final releases) happen outside it, and the look for idle
+    // copies runs every `exact_every()` askings, not at every one that finds
+    // none (Belobug/VIctory-Belobug-AMD#346: every list worker waited here
+    // on an NVIDIA card, at hundreds of new copies a frame).
+    let (now, gone) = {
+        let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        let (tick, map) = &mut *guard;
+        *tick += 1;
+        let now = *tick;
+        if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+            *used = now;
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            return Some(shadow.clone());
+        }
+        let mut gone = Vec::new();
+        if map.len() >= MANY && now >= EXACT_PRUNE.load(Ordering::Relaxed) {
+            EXACT_PRUNE.store(now + exact_every(), Ordering::Relaxed);
+            // Held by the map alone (no list), its buffer by the copy alone
+            // (no slot shows it), and not asked for lately.
+            let idle: Vec<(u64, u64)> = map
+                .iter()
+                .filter(|(_, (shadow, used))| {
+                    Arc::strong_count(shadow) == 1 && crate::host::references(&shadow.buffer) <= 1 && *used + LATELY <= now
+                })
+                .map(|(&key, _)| key)
+                .collect();
+            gone.extend(idle.into_iter().filter_map(|key| map.remove(&key)));
+        }
+        (now, gone)
+    };
+    drop(gone);
     let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), (shadow.clone(), now));
+    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    // Another thread made the same copy meanwhile: theirs is the one kept
+    // (and ours let go once the lock is released).
+    if let Some((theirs, used)) = guard.1.get_mut(&(address, len)) {
+        *used = (*used).max(now);
+        theirs.used.store(crate::host::moment(), Ordering::Relaxed);
+        let theirs = theirs.clone();
+        drop(guard);
+        drop(shadow);
+        return Some(theirs);
+    }
+    guard.1.insert((address, len), (shadow.clone(), now));
+    drop(guard);
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     Some(shadow)
 }
