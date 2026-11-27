@@ -377,6 +377,12 @@ fn changed_kept() -> bool {
     *KEPT.get_or_init(|| std::env::var("VICTORY_CARD_CHANGED_LIST").is_ok_and(|v| v == "1" || v == "alt"))
 }
 
+/// Since the last frame-rate line, microseconds of copying back copies in
+/// the PC's memory (`Shadow::copy_back_with`), every build: comparing the
+/// copy with its snapshot to find the 64 KiB pieces the GPU changed, and
+/// reading title memory there and writing the GPU's bytes into it.
+pub(crate) static BACK_US: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
 /// bytes; the waits for the card the fetches added and their microseconds.
@@ -3705,19 +3711,20 @@ impl Shadow {
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission (on several threads: gigabytes a frame, bound by
             // memory speed), title memory read only where the GPU wrote.
-            #[cfg(feature = "diagnostics")]
             let scanning = std::time::Instant::now();
             let differing = match found {
                 Some(found) => found,
                 None => self.differing(from, to, before),
             };
+            let scanned = scanning.elapsed().as_micros() as u64;
+            BACK_US[0].fetch_add(scanned, std::sync::atomic::Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            let syncing = {
+            {
                 use crate::copystat::{C, add};
-                add(C::BackScanUs, scanning.elapsed().as_micros() as u64);
+                add(C::BackScanUs, scanned);
                 add(C::BackDiffer, differing.len() as u64);
-                std::time::Instant::now()
-            };
+            }
+            let syncing = std::time::Instant::now();
             // Where the copy changes (the GPU wrote, and below the title's
             // bytes come in), a kept snapshot is no longer current.
             for &(at, n) in &differing {
@@ -3754,8 +3761,10 @@ impl Shadow {
             // frame). Asking about the whole range here, to note them
             // current, cost more: 19-31 askings a frame over 110-174 MB of
             // view memory, each a walk of its guards.
+            let synced = syncing.elapsed().as_micros() as u64;
+            BACK_US[1].fetch_add(synced, std::sync::atomic::Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::BackSyncUs, syncing.elapsed().as_micros() as u64);
+            crate::copystat::add(crate::copystat::C::BackSyncUs, synced);
         }
         written
     }

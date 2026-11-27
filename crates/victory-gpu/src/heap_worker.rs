@@ -1,5 +1,5 @@
 //! The pass that uploads textures picked by index, on a thread of its own
-//! (`VICTORY_HEAP_WORKER=1`; off by default; needs `VICTORY_LATE_WAIT`).
+//! (on by default with late submissions; `VICTORY_HEAP_WORKER=0` off).
 //!
 //! [`crate::draw::State::heap_textures`] runs on whichever thread of the
 //! title records the frame's first shader that picks textures by index: it
@@ -37,10 +37,18 @@ use crate::descriptor::Heap;
 use crate::host::HostList;
 use crate::object::This;
 
-/// Whether the pass runs on its own thread now.
+/// Whether the pass runs on its own thread now (on by default with late
+/// submissions; `VICTORY_HEAP_WORKER=0` keeps it on the recording thread).
+///
+/// On by default since run 8 on the owner's PC (RTX 4070, 5800X), the
+/// switch alone against run 7: the frame line's heap pass fell from a
+/// median of 154 ms a frame to 62 (the slowest from 904 to 146), frames of
+/// over 300 draws from a median of 689 ms to 612 and a slowest of 2,427 to
+/// 1,180, the faces, skin and hair drawn as before. The gta6 base measured
+/// the pass at 96-116 ms against 33 with it (run 309).
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_WORKER").is_some_and(|v| v == "1")) && crate::host::late()
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_WORKER").is_none_or(|v| v != "0")) && crate::host::late()
 }
 
 /// For the frame line, since the last one: nanoseconds the worker was at

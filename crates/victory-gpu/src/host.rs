@@ -3448,6 +3448,25 @@ static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
 /// copies' pieces, microseconds of landing in all.
 static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
+/// Since the last frame-rate line, of the thread that lands flights: the
+/// microseconds of its landing by part: card copies' pieces fetched and
+/// merged into title memory (their waits for the card included), the other
+/// copies' ranges compared and merged (`relay_hand_back`) and closed,
+/// read-backs (textures and buffers the title reads on the CPU), and the
+/// card copies' checks after their flights (`card_done`).
+/// Why: in runs 7 and 8 on the owner's PC landing took 250-1,150 ms a
+/// frame, of which the waits for the card were 50-280; the frame line could
+/// not say what the rest was.
+static LANDING_PARTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// `f`'s result, its time added to [`LANDING_PARTS`]' place `part`.
+fn landing_part<T>(part: usize, f: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let out = f();
+    LANDING_PARTS[part].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    out
+}
+
 /// Since the last frame-rate line, with [`inflight_fetch`]: pieces merged
 /// from the slots their flights fetched them to, their bytes, landings that
 /// went the old way because a plan's pieces overflowed the slots, and
@@ -5150,6 +5169,14 @@ fn late_line(frames: f64) {
             r[2] / 1000.0,
             r[3] / 1000.0,
             r[4] / 1000.0,
+        );
+        let [card, others, read_backs, checks] = [0, 1, 2, 3].map(|i| LANDING_PARTS[i].swap(0, Ordering::Relaxed) as f64 / frames / 1000.0);
+        let [scan, sync] = [0, 1].map(|i| crate::shadow::BACK_US[i].swap(0, Ordering::Relaxed) as f64 / frames / 1000.0);
+        tracing::info!(
+            "landing by part, ms per frame: card copies' pieces fetched and merged {card:.1} (their waits for the card \
+             included), the other copies' ranges compared and merged {others:.1} (of it comparing copies with their snapshots \
+             {scan:.1}, reading title memory and writing the GPU's bytes into it {sync:.1}; any thread), read-backs {read_backs:.1}, card copies' checks after their \
+             flights {checks:.1}"
         );
         if inflight_fetch() {
             let i: Vec<f64> = INFLIGHT_STATS.iter().map(|i| i.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -6905,7 +6932,8 @@ impl Host {
                 let plans: Vec<(u64, &CardPlan)> = flights.iter().filter_map(|f| f.card.as_ref().map(|card| (f.number, card))).collect();
                 let behind = flights.iter().map(|f| f.fence).max().unwrap_or(0);
                 let landed = flights.iter().map(|f| f.number).max().unwrap_or(0);
-                self.relay_card_back(&plans, fetch, behind, landed);
+                landing_part(0, || self.relay_card_back(&plans, fetch, behind, landed));
+                let merging = std::time::Instant::now();
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
@@ -6929,6 +6957,7 @@ impl Host {
                         shadow.copy_back_done(ranges);
                     }
                 }
+                LANDING_PARTS[1].fetch_add(merging.elapsed().as_micros() as u64, Ordering::Relaxed);
                 copy_back(0, landing.elapsed().as_micros() as u64);
                 RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
@@ -6941,11 +6970,13 @@ impl Host {
             match item {
                 Late::Run(flight) => {
                     last = flight.number;
-                    for &i in &flight.order {
-                        read_backs(flight.lists[i].host());
-                    }
+                    landing_part(2, || {
+                        for &i in &flight.order {
+                            read_backs(flight.lists[i].host());
+                        }
+                    });
                     if let Some(card) = flight.card {
-                        self.card_done(card);
+                        landing_part(3, || self.card_done(card));
                     }
                     landed.push((flight.lists, flight.order));
                 }
