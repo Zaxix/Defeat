@@ -104,8 +104,11 @@ struct Card {
     /// With [`relay`]: the offsets that went from `dirty` to the card's
     /// side, each with the number of the send that took it
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
-    /// Locked inside `dirty`'s lock.
-    sent: Mutex<Vec<(usize, usize, u64)>>,
+    /// Locked inside `dirty`'s lock. A send's offsets are kept together, in
+    /// order and joined, so a merge looks up a piece's by a search
+    /// ([`sent_within`]): run 12 sent up to ~100,000 patched runs a
+    /// submission, and every merged piece walked all of them.
+    sent: Mutex<Vec<(u64, Vec<(usize, usize)>)>>,
     /// With [`masked_patch_now`]: the title's changed bytes under flights'
     /// shader writes that go to the card's side as a masked patch (a
     /// dword at a time, only the changed bytes stored) rather than as
@@ -701,11 +704,13 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
 pub(crate) type PatchWord = [u32; 3];
 
 /// A copy's masked patch not yet sent ([`Card::patch`]): its words in the
-/// order they were made, and the byte runs they set.
+/// order they were made, and the byte runs they set, a page's runs (in
+/// order, none touching) at a time so that a merge finds a piece's by a
+/// search ([`sent_within`]).
 #[derive(Default)]
 struct Patch {
     words: Vec<PatchWord>,
-    ranges: Vec<(usize, usize)>,
+    ranges: Vec<Vec<(usize, usize)>>,
 }
 
 /// `VICTORY_MASKED_PATCH`: 0 off, 1 on (the default; run 362: waiting for the card 21 -> 2 ms, usual frame -10 ms), 2 in turn (`alt`).
@@ -933,25 +938,25 @@ pub(crate) fn card_patches(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<PatchWord>, Ve
         let Some(c) = shadow.card.as_ref() else {
             continue;
         };
-        let taken = {
+        let (words, runs) = {
             let _dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let mut patch = c.patch.lock().unwrap_or_else(|e| e.into_inner());
             if patch.words.is_empty() {
                 continue;
             }
             let taken = std::mem::take(&mut *patch);
+            let runs = joined(taken.ranges.concat());
             if relay() {
                 let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
-                sent.retain(|s| s.2 > fetched);
-                sent.extend(taken.ranges.iter().map(|&(a, b)| (a, b, sent_as)));
+                sent.retain(|s| s.0 > fetched);
+                sent.push((sent_as, runs.clone()));
             }
-            taken
+            (taken.words, runs)
         };
         // The runs are only hashed again (`Host::card_before`): lean, one
         // span per piece ([`piece_spans`]), the same pieces.
-        let runs = joined(taken.ranges);
         let runs = if patch_lean_now() { piece_spans(shadow.start as usize, &runs) } else { runs };
-        out.push((shadow.clone(), folded(taken.words), runs));
+        out.push((shadow.clone(), folded(words), runs));
     }
     out
 }
@@ -964,10 +969,18 @@ fn take_dirty(c: &Card, fetched: u64, sent_as: u64) -> Vec<(usize, usize)> {
     let ranges = std::mem::take(&mut *dirty);
     if relay() {
         let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
-        sent.retain(|s| s.2 > fetched);
-        sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
+        sent.retain(|s| s.0 > fetched);
+        sent.push((sent_as, joined(ranges.clone())));
     }
     ranges
+}
+
+/// Of `ranges` (in order, none touching: [`joined`]'s), those that meet
+/// `[from, to)`, found by a search.
+fn sent_within(ranges: &[(usize, usize)], from: usize, to: usize) -> &[(usize, usize)] {
+    let first = ranges.partition_point(|r| r.1 <= from);
+    let last = first + ranges[first..].partition_point(|r| r.0 < to);
+    &ranges[first..last]
 }
 
 /// Ranges in order, those that overlap or touch as one.
@@ -1039,7 +1052,23 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 
 #[cfg(test)]
 mod card_tests {
-    use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs};
+    use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs, sent_within};
+
+    /// The search finds exactly the joined ranges a walk over all of them
+    /// finds for every stretch, at and across their edges.
+    #[test]
+    fn sent_ranges_found_by_search_are_the_walk_s() {
+        let raw: Vec<(usize, usize)> = (0..200).map(|i| (i * 37 % 1000, i * 37 % 1000 + 1 + i % 5)).collect();
+        let ranges = joined(raw);
+        for from in (0..1100).step_by(7) {
+            for len in [1, 3, 16, 64, 500] {
+                let to = from + len;
+                let walk: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, b)| a < to && b > from).collect();
+                assert_eq!(sent_within(&ranges, from, to), &walk[..], "{from}..{to}");
+            }
+        }
+        assert!(sent_within(&[], 0, 10).is_empty());
+    }
 
     /// Joined runs hold every piece of the runs given, once, and no other.
     #[test]
@@ -4760,7 +4789,7 @@ impl Shadow {
         let _dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
         let mut patch = card.patch.lock().unwrap_or_else(|e| e.into_inner());
         patch.words.extend(words);
-        patch.ranges.extend(runs.iter().map(|&(r, m)| (at + r, at + r + m)));
+        patch.ranges.push(runs.iter().map(|&(r, m)| (at + r, at + r + m)).collect());
     }
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
@@ -4965,13 +4994,14 @@ impl Shadow {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let patch = card.patch.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
-            dirty
-                .iter()
-                .copied()
-                .chain(patch.ranges.iter().copied())
-                .chain(sent.iter().filter(|s| s.2 > fetched_after).map(|s| (s.0, s.1)))
-                .filter(|&(a, b)| a < at + n && b > at)
-                .collect()
+            let mut skip: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < at + n && b > at).collect();
+            for page in &patch.ranges {
+                skip.extend_from_slice(sent_within(page, at, at + n));
+            }
+            for (_, ranges) in sent.iter().filter(|s| s.0 > fetched_after) {
+                skip.extend_from_slice(sent_within(ranges, at, at + n));
+            }
+            skip
         };
         title.clear();
         title.resize(n, 0);
@@ -5974,7 +6004,7 @@ mod card_merge_tests {
                 staging: staging.clone(),
                 before: Mutex::new(None),
                 dirty: Mutex::default(),
-                sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),
+                sent: Mutex::new(vec![(7, vec![(title_byte, title_byte + 1)])]),
                 patch: Mutex::default(),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
@@ -5982,7 +6012,7 @@ mod card_merge_tests {
             });
             // As `card_dirty` with the mark set by the old-way fetch.
             if let Some(card) = &shadow.card {
-                card.sent.lock().unwrap().retain(|s| s.2 > mark);
+                card.sent.lock().unwrap().retain(|s| s.0 > mark);
             }
             // Flight 6's slot: the card's bytes behind its lists, before send 7.
             let mut slot = content.clone();
