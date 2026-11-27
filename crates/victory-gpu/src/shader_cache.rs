@@ -81,7 +81,7 @@ fn build() -> [u8; 32] {
     if let Some(exe) = exe {
         h.update(exe);
     }
-    h.update(&victory_shader::emit::translation_fingerprint());
+    h.update(&without_diagnostics(victory_shader::emit::translation_fingerprint()));
     // The list this file reads for the translator (`translate_listed`): the
     // shader crate's fingerprint does not see it.
     h.update(b"VICTORY_WAVE_WIDE_ONLY=");
@@ -103,6 +103,48 @@ fn build() -> [u8; 32] {
     // changes.
     h.update(include_bytes!("shader_cache.key"));
     *h.finalize().as_bytes()
+}
+
+/// `fingerprint` without the values of the translator's diagnostic switches
+/// (`VICTORY_*_WHY`, which only print why a form was or was not taken):
+/// setting one made every cached translation a miss, so a diagnostics run
+/// translated every shader again. Unset, the fingerprint is unchanged
+/// (the name stays, its empty value too), so the caches made before stay
+/// valid. Each switch is `NAME=value\0` in the fingerprint.
+fn without_diagnostics(fingerprint: Vec<u8>) -> Vec<u8> {
+    const WHY: &[u8] = b"_WHY=";
+    let mut out = Vec::with_capacity(fingerprint.len());
+    let mut rest = &fingerprint[..];
+    while let Some(at) = rest.windows(WHY.len()).position(|w| w == WHY) {
+        let after = at + WHY.len();
+        out.extend_from_slice(&rest[..after]);
+        let end = rest[after..].iter().position(|&b| b == 0).map_or(rest.len(), |n| after + n);
+        rest = &rest[end..];
+    }
+    out.extend_from_slice(rest);
+    out
+}
+
+/// Whether container `c`'s hash is on `VICTORY_SHADER_FRESH` (16-hex-digit
+/// hashes as the log names shaders, comma separated): translated anew, not
+/// read from the cache (nor written to it), so that the translator's
+/// diagnostics (`VICTORY_WAVE_WHY`, `VICTORY_DESC_WHY`) are printed for
+/// shaders the cache holds. The translation is the same.
+fn fresh(c: &[u8]) -> bool {
+    static LIST: OnceLock<Vec<String>> = OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        let list: Vec<String> = std::env::var("VICTORY_SHADER_FRESH")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect();
+        if !list.is_empty() {
+            tracing::info!(shaders = list.len(), "shaders translated anew, not from the cache (VICTORY_SHADER_FRESH)");
+        }
+        list
+    });
+    !list.is_empty() && listed_pair_hash(blake3::hash(c).to_hex().as_str(), list)
 }
 
 /// A container translated with the wave-wide form allowed when its hash is
@@ -147,6 +189,18 @@ fn translate_listed(c: &[u8]) -> Result<HostShader, String> {
 
 fn listed_pair_hash(hash: &str, list: &[String]) -> bool {
     hash.get(..16).is_some_and(|prefix| list.iter().any(|h| h == prefix))
+}
+
+#[cfg(test)]
+#[test]
+fn diagnostic_switches_leave_the_fingerprint_as_unset() {
+    let unset = b"HASH\x00\x01VICTORY_DESC_WHY=\0VICTORY_GROUP_SYNC=2\0VICTORY_WAVE_WHY=\0tail".to_vec();
+    let set = b"HASH\x00\x01VICTORY_DESC_WHY=1\0VICTORY_GROUP_SYNC=2\0VICTORY_WAVE_WHY=yes\0tail".to_vec();
+    assert_eq!(without_diagnostics(unset.clone()), unset, "unset: unchanged, so old caches stay valid");
+    assert_eq!(without_diagnostics(set), unset);
+    // Other switches still count.
+    let other = b"HASH\x00\x01VICTORY_DESC_WHY=\0VICTORY_GROUP_SYNC=0\0VICTORY_WAVE_WHY=\0tail".to_vec();
+    assert_ne!(without_diagnostics(other), unset);
 }
 
 #[cfg(test)]
@@ -205,6 +259,11 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = translate_listed;
+    if fresh(container) {
+        let hash = blake3::hash(container).to_hex();
+        eprintln!("SHADER-FRESH {} translating anew (VICTORY_SHADER_FRESH)", &hash.as_str()[..16]);
+        return translate(container);
+    }
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
