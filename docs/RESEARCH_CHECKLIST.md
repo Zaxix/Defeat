@@ -33,7 +33,7 @@
 | R16 | ⬜ 🎮 | — | DRED full/light/faults and per-second removal rows exist in the base. | 30–60+ min runs. |
 | R17 | ⬜ 🎮 | — | — | — |
 | R18 / R19 | 🟡 research | — | Static analysis only (five-pool initializer RVA 0x1E86440, flags 0x1004/0x1404/0x8404/0x2404/0x2004). | Runtime correlation. |
-| R20 | 🟡 🎮 | \`cf4a43b\` | Levels-on-demand view slots remade only before a submission with nothing in the air, for every view heap (\`VICTORY_VIEWS_REMADE_QUIET=0\` old, \`=1\` old quiet); longest wait logged. **Not built on Windows in isolation, but included in the \`8a3f99d\` test run.** | Long runs, 0 vs default, with DRED. |
+| R20 | 🟢 🎮 | \`cf4a43b\` | Levels-on-demand view slots remade only before a submission with nothing in the air, for every view heap (\`VICTORY_VIEWS_REMADE_QUIET=0\` old, \`=1\` old quiet); longest wait logged. | Long runs, 0 vs default, with DRED. |
 | R21 | ⬜ 🎮 | — | \`VICTORY_RETIRE_LEAN\` / \`VICTORY_REAPER\` exist in the base, off. | Measure first. |
 | R23 | 🟢 🎮 | \`995524a\` | Observe-only placement look every 30 s (\`VICTORY_PLACEMENT_LOOK=0\` off): per placement copies/bytes/asks/refreshed/written back, asks × rewrite-share grid, budget line, hot-and-stable PC copies and whether they would fit. Plus title PAGE_GRAPHICS census and costs (\`b87c2cc\`, \`79e2622\`, \`259dc72\`). | One in-game run of the lines. |
 | R24 | 🟡 partial | \`b87c2cc\`, \`79e2622\` | Flags recorded (placeholder splits too); GPU writes against read-only flags counted and warned. \`VirtualFree\` blind spot remains. | Write-against count = 0 in game; alias/generation work. |
