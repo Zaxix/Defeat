@@ -301,18 +301,67 @@ pub fn slow_processors() -> usize {
 /// threads (on the console's eight cores' worth of processors), and the
 /// pipeline, DirectStorage and helper workers (12 to 16 each on a 5800X)
 /// are at normal priority, so the frame's own thread waited its turn
-/// among them whenever all were busy.
+/// among them whenever all were busy. Run 13 (with it) had the title
+/// submit later than run 12 (43 ms of the card's idle time a frame, 13),
+/// with the shader cache translating all run: `VICTORY_OUR_PRIORITY=alt`
+/// turns it on and off every 20 s ([`priority_tick`]), one run's A/B.
 pub fn raise_priority(what: &str) {
-    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_OUR_PRIORITY").is_none_or(|v| v != "0")) {
+    match priority_mode() {
+        0 => {}
+        1 => set_priority(what, true),
+        _ => priority_tick(what),
+    }
+}
+
+/// `VICTORY_OUR_PRIORITY`: 0 off, 1 on (unset), 2 `alt`.
+fn priority_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_OUR_PRIORITY").as_deref() {
+        Ok("0") => 0,
+        Ok("alt") => 2,
+        _ => 1,
+    })
+}
+
+fn set_priority(what: &str, above: bool) {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL,
+    };
+    let level = if above { THREAD_PRIORITY_ABOVE_NORMAL } else { THREAD_PRIORITY_NORMAL };
+    // SAFETY: our own thread.
+    if unsafe { SetThreadPriority(GetCurrentThread(), level) } == 0 {
+        tracing::warn!(what, error = %std::io::Error::last_os_error(), "the thread's priority could not be set");
+    } else {
+        tracing::info!(
+            what,
+            "the thread runs {} (VICTORY_OUR_PRIORITY: 0 normal, alt in turn every 20 s)",
+            if above { "above normal priority" } else { "at normal priority" }
+        );
+    }
+}
+
+/// With `VICTORY_OUR_PRIORITY=alt`, called by each of the two threads at
+/// the top of its loop: above normal for twenty seconds, normal for the
+/// next twenty, in turn (the change said once per thread in the log, and
+/// once in a line of its own for the frame lines to be split by).
+pub fn priority_tick(what: &str) {
+    if priority_mode() != 2 {
         return;
     }
-    // SAFETY: our own thread.
-    if unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) } == 0 {
-        tracing::warn!(what, error = %std::io::Error::last_os_error(), "the thread's priority could not be raised");
-    } else {
-        tracing::info!(what, "the thread runs above normal priority (VICTORY_OUR_PRIORITY=0: not)");
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let above = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20).is_multiple_of(2);
+    thread_local! {
+        static NOW: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+    if NOW.with(|n| n.replace(Some(above))) != Some(above) {
+        set_priority(what, above);
+        static SAID: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+        if SAID.swap(u8::from(above), std::sync::atomic::Ordering::Relaxed) != u8::from(above) {
+            tracing::info!(
+                "our threads' priority (VICTORY_OUR_PRIORITY=alt) from now: {}",
+                if above { "ABOVE NORMAL" } else { "normal" }
+            );
+        }
     }
 }
 

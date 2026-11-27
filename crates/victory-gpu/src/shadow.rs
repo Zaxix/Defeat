@@ -4978,16 +4978,20 @@ impl Shadow {
         if at + gpu.len() > self.len as usize {
             return 0;
         }
+        let mut clock = MergeClock::new();
         let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        clock.part(0);
         // SAFETY: inside the mapping (checked above). The offsets are in a
         // range declared and not done with, which no refresh writes; what
         // does write it (the title's bytes put in under shader writes)
         // holds the lock held here.
         let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
         let Some(first) = first_difference(gpu, held) else {
+            clock.part(1);
             return 0;
         };
         let last = last_difference(gpu, held).unwrap_or(first);
+        clock.part(1);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
         let skip: Vec<(usize, usize)> = {
@@ -5003,6 +5007,7 @@ impl Shadow {
             }
             skip
         };
+        clock.part(2);
         title.clear();
         title.resize(n, 0);
         // Who touched the page since its last store is looked at before our
@@ -5012,6 +5017,7 @@ impl Shadow {
         #[cfg(feature = "diagnostics")]
         crate::backreads::before(start + at);
         let mapped = crate::host::read_into((start + at) as *const u8, title);
+        clock.part(3);
         // The stretch as read: what the card did not change is the
         // title's, and may have been written again since.
         let as_read = (mapped && (merge_race_on() || merge_words_on())).then(|| title.clone());
@@ -5022,6 +5028,7 @@ impl Shadow {
             // the card wrote, as before; `title` is scratch then.
             changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
         }
+        clock.part(4);
         if !mapped || !changed {
             return 0;
         }
@@ -5037,6 +5044,36 @@ impl Shadow {
         #[cfg(feature = "diagnostics")]
         crate::backreads::stored(self.id, (self.start, self.len), start + at, n, false);
         n
+    }
+}
+
+/// Nanoseconds of the copy-back's merges of card copies' pieces
+/// ([`Shadow::card_merge_relay`]) by part: waiting for the copy's merge
+/// lock (the submitting thread's merge under flights holds it), finding
+/// what the card changed, gathering the bytes the title sent since, reading
+/// title memory, merging, and writing back (the rest, to the end). Run 13
+/// had 70-74 ms a frame in these merges (48 in run 12) and nothing split
+/// them.
+pub(crate) static MERGE_PARTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// Times the parts of one merge into [`MERGE_PARTS`]; the time after the
+/// last part taken goes to the last part when dropped.
+struct MergeClock(std::time::Instant);
+
+impl MergeClock {
+    fn new() -> Self {
+        MergeClock(std::time::Instant::now())
+    }
+    fn part(&mut self, part: usize) {
+        let now = std::time::Instant::now();
+        MERGE_PARTS[part].fetch_add((now - self.0).as_nanos() as u64, Ordering::Relaxed);
+        self.0 = now;
+    }
+}
+
+impl Drop for MergeClock {
+    fn drop(&mut self) {
+        MERGE_PARTS[5].fetch_add(self.0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 }
 

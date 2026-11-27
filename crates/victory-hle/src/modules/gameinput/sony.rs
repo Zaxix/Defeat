@@ -173,14 +173,28 @@ mod host {
         PADS.lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|p| p.alive.load(std::sync::atomic::Ordering::Relaxed));
-        for path in hid_paths() {
+        // What the scan saw, said when it changes: run 13 had the owner's
+        // PS5 pad plugged in and no line about it, and nothing to tell why.
+        static SEEN: Mutex<Option<String>> = Mutex::new(None);
+        let paths = hid_paths();
+        let mut sonys = Vec::new();
+        for path in paths.iter().cloned() {
             let known = PADS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|p| p.path == path);
             if known {
+                sonys.push("read already".to_owned());
                 continue;
             }
-            let Some((kind, product)) = sony(&path) else {
+            let Some((vendor, product)) = ids(&path) else {
                 continue;
             };
+            if vendor != SONY {
+                continue;
+            }
+            let Some(kind) = kind(product) else {
+                sonys.push(format!("product {product:#06x} (not a pad we read)"));
+                continue;
+            };
+            sonys.push(format!("{kind:?} {product:#06x}"));
             let Some((handle, length)) = open(&path) else {
                 continue;
             };
@@ -201,6 +215,14 @@ mod host {
             );
             PADS.lock().unwrap_or_else(|e| e.into_inner()).push(Pad { path, state, alive });
         }
+        let seen = format!("{} HID devices, Sony ones: [{}]", paths.len(), sonys.join(", "));
+        let mut last = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if last.as_deref() != Some(seen.as_str()) {
+            tracing::info!(
+                "PlayStation pads: the scan found {seen} (none: the pad is off, held hidden by HidHide or DS4Windows, or not a HID device here)"
+            );
+            *last = Some(seen);
+        }
     }
 
     /// Reads reports until the pad is gone.
@@ -212,6 +234,7 @@ mod host {
         alive: &std::sync::atomic::AtomicBool,
     ) {
         let mut report = vec![0u8; length.max(64)];
+        let mut first = true;
         loop {
             let mut got = 0u32;
             // SAFETY: room for `report.len()` bytes; a handle opened for
@@ -222,7 +245,17 @@ mod host {
             if !ok {
                 break;
             }
-            if let Some(pad) = parse(kind, &report[..got as usize]) {
+            let pad = parse(kind, &report[..got as usize]);
+            if first {
+                first = false;
+                tracing::info!(
+                    id = format_args!("{:#04x}", report[0]),
+                    bytes = got,
+                    read = pad.is_some(),
+                    "a PlayStation pad's first report"
+                );
+            }
+            if let Some(pad) = pad {
                 *state.lock().unwrap_or_else(|e| e.into_inner()) = Some(pad);
             }
         }
@@ -243,6 +276,7 @@ mod host {
             SetupDiGetClassDevsW(&guid, std::ptr::null(), std::ptr::null_mut(), DIGCF_PRESENT | DIGCF_DEVICEINTERFACE)
         };
         if set == INVALID_HANDLE_VALUE as isize || set == 0 {
+            tracing::warn!(error = %std::io::Error::last_os_error(), "PlayStation pads: the HID devices could not be listed");
             return Vec::new();
         }
         let mut paths = Vec::new();
@@ -291,8 +325,8 @@ mod host {
         paths
     }
 
-    /// Whether the device at `path` is a Sony pad, and which.
-    fn sony(path: &[u16]) -> Option<(Kind, u16)> {
+    /// The vendor and product numbers of the HID device at `path`.
+    fn ids(path: &[u16]) -> Option<(u16, u16)> {
         // No access asked: enough for the attributes, and it opens devices
         // others hold (keyboards, mice).
         // SAFETY: a NUL-terminated path.
@@ -320,10 +354,7 @@ mod host {
         let ok = unsafe { HidD_GetAttributes(handle, &mut attributes) };
         // SAFETY: ours.
         unsafe { CloseHandle(handle) };
-        if !ok || attributes.VendorID != SONY {
-            return None;
-        }
-        Some((kind(attributes.ProductID)?, attributes.ProductID))
+        ok.then_some((attributes.VendorID, attributes.ProductID))
     }
 
     /// The pad opened for reading, and the length of its input reports.
@@ -341,7 +372,10 @@ mod host {
             )
         };
         if handle == INVALID_HANDLE_VALUE {
-            tracing::info!("a PlayStation pad could not be opened for reading (another program may hold it alone)");
+            tracing::warn!(
+                error = %std::io::Error::last_os_error(),
+                "a PlayStation pad could not be opened for reading (another program, such as Steam or DS4Windows, may hold it alone)"
+            );
             return None;
         }
         let mut data = 0;

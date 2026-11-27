@@ -133,23 +133,22 @@ fn card_part(i: usize, since: std::time::Instant) -> std::time::Instant {
 /// copies brought up to date; the submission's last flush included) and
 /// the texture checks (count, microseconds). An instrument: "the lists'
 /// steps" was 27-45 ms a frame (run 363) and no line split it.
-#[cfg(feature = "diagnostics")]
+/// In every build since run 13 (it was a diagnostics build's): run 13's
+/// list steps were 32-50 ms a frame of the submitting thread's, and a
+/// release build had nothing to split them.
 static STEP_KINDS: [[std::sync::atomic::AtomicU64; 2]; 7] =
     [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 7];
-#[cfg(feature = "diagnostics")]
 static STEP_FLUSHES: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// Times one step of [`STEP_KINDS`] from `.1` until it is dropped (at the
-/// end of the step, `continue` included).
-#[cfg(feature = "diagnostics")]
-struct StepTimed(usize, std::time::Instant);
+/// end of the step, `continue` included), into the list's own tally `.2`
+/// (added to the statics once a list: some 22,000 steps a frame).
+struct StepTimed<'a>(usize, std::time::Instant, &'a [[std::cell::Cell<u64>; 2]; 7]);
 
 /// Times a flush (`.0` = 0: [`STEP_FLUSHES`] 0-2, `.1` copies) or a
 /// texture check (`.0` = 3: 3-4) from `.2` until it is dropped.
-#[cfg(feature = "diagnostics")]
 struct FlushTimed(usize, u64, std::time::Instant);
 
-#[cfg(feature = "diagnostics")]
 impl Drop for FlushTimed {
     fn drop(&mut self) {
         STEP_FLUSHES[self.0].fetch_add(1, Ordering::Relaxed);
@@ -160,14 +159,14 @@ impl Drop for FlushTimed {
     }
 }
 
-#[cfg(feature = "diagnostics")]
-impl Drop for StepTimed {
+impl Drop for StepTimed<'_> {
     fn drop(&mut self) {
-        STEP_KINDS[self.0][0].fetch_add(1, Ordering::Relaxed);
+        let tally = &self.2[self.0];
+        tally[0].set(tally[0].get() + 1);
         // Refreshes noted (some 22,000 a frame, each a map's look) are
         // counted, not timed: their time is the steps' part less the others.
         if self.0 != 2 {
-            STEP_KINDS[self.0][1].fetch_add(self.1.elapsed().as_micros() as u64, Ordering::Relaxed);
+            tally[1].set(tally[1].get() + self.1.elapsed().as_nanos() as u64);
         }
     }
 }
@@ -5172,6 +5171,7 @@ fn relay_worker() {
     };
     let mut fetch: Option<RelayFetch> = None;
     loop {
+        crate::framelog::priority_tick("victory-relay");
         let next = {
             let mut line = line();
             loop {
@@ -5343,6 +5343,17 @@ fn late_line(frames: f64) {
              {scan:.1}, reading title memory and writing the GPU's bytes into it {sync:.1}; any thread), read-backs {read_backs:.1}, card copies' checks after their \
              flights {checks:.1}"
         );
+        let m = [0, 1, 2, 3, 4, 5].map(|i| crate::shadow::MERGE_PARTS[i].swap(0, Ordering::Relaxed) as f64 / frames / 1e6);
+        tracing::info!(
+            "the card copies' merges by part, ms per frame (any thread): the copy's merge lock waited for {:.1}, what the card changed \
+             found {:.1}, the title's bytes sent since gathered {:.1}, title memory read {:.1}, merged {:.1}, written back {:.1}",
+            m[0],
+            m[1],
+            m[2],
+            m[3],
+            m[4],
+            m[5]
+        );
         if inflight_fetch() {
             let i: Vec<f64> = INFLIGHT_STATS.iter().map(|i| i.swap(0, Ordering::Relaxed) as f64 / frames).collect();
             tracing::info!(
@@ -5431,12 +5442,11 @@ fn late_line(frames: f64) {
             card[5],
             card[6]
         );
-        #[cfg(feature = "diagnostics")]
         {
             let k = [0, 1, 2, 3, 4, 5, 6].map(|i| {
                 (
                     STEP_KINDS[i][0].swap(0, Ordering::Relaxed) as f64 / frames,
-                    STEP_KINDS[i][1].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames,
+                    STEP_KINDS[i][1].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames,
                 )
             });
             let f = [0, 1, 2, 3, 4].map(|i| STEP_FLUSHES[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -9909,9 +9919,9 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        let tally: [[std::cell::Cell<u64>; 2]; 7] = Default::default();
         for step in &self.deferred().copies {
             let started = std::time::Instant::now();
-            #[cfg(feature = "diagnostics")]
             let _timed = StepTimed(
                 match step {
                     Step::Copy(..) => 0,
@@ -9923,6 +9933,7 @@ impl HostList {
                     Step::Texture(..) => 6,
                 },
                 started,
+                &tally,
             );
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -10044,6 +10055,12 @@ impl HostList {
             };
             preparing(0, started.elapsed().as_micros() as u64);
             preparing(1, copied as u64);
+        }
+        for (kind, t) in tally.iter().enumerate() {
+            if t[0].get() > 0 {
+                STEP_KINDS[kind][0].fetch_add(t[0].get(), Ordering::Relaxed);
+                STEP_KINDS[kind][1].fetch_add(t[1].get(), Ordering::Relaxed);
+            }
         }
     }
 }
@@ -10387,7 +10404,6 @@ impl Batch {
         if self.due_textures.is_empty() {
             return;
         }
-        #[cfg(feature = "diagnostics")]
         let _timed = FlushTimed(3, 0, std::time::Instant::now());
         let due = std::mem::take(&mut self.due_textures);
         PARALLEL_CHECKS[0].fetch_add(1, Relaxed);
@@ -10423,7 +10439,6 @@ impl Batch {
 
     fn flush(&mut self) {
         self.check_textures();
-        #[cfg(feature = "diagnostics")]
         let _timed = FlushTimed(0, self.refreshes.len() as u64, std::time::Instant::now());
         self.index.clear();
         // One write-watch asking for the copies that lie close together,

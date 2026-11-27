@@ -519,6 +519,7 @@ fn worker() {
     crate::framelog::keep_on_fast_cores("victory-submit");
     crate::framelog::raise_priority("victory-submit");
     loop {
+        crate::framelog::priority_tick("victory-submit");
         {
             let mut work = lock(&WORK.0);
             while !*work {
