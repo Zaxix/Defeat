@@ -92,7 +92,16 @@ fn build() -> [u8; 32] {
     if let Some(value) = std::env::var_os("VICTORY_WAVE_PAIRS_ONLY") {
         h.update(value.as_encoded_bytes());
     }
-    h.update(include_bytes!("shader_cache.rs"));
+    // The encoding of cache entries (`encode`, `decode`) is part of the
+    // key. It was this file's whole text, so that any edit to this file
+    // (a counter, a comment) made every cached translation a miss: run 3
+    // on the owner's PC translated every shader again after one did. The
+    // file's text at that edit (11169c3) is kept in `shader_cache.key` and
+    // hashed instead, byte for byte as before (the repository's text files
+    // are checked out with LF everywhere), so the caches made since stay
+    // valid. Change that file (any edit will do) only when the encoding
+    // changes.
+    h.update(include_bytes!("shader_cache.key"));
     *h.finalize().as_bytes()
 }
 
