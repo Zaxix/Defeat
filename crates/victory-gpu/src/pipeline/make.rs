@@ -200,10 +200,13 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         // world and lighting set-up passes) or with `compute_waits`: made
         // here, or waited for while a worker makes it, instead of dropping
         // its dispatch after the frame's budget. `make` keeps its panic guard.
-        if p.graphics.is_none() && (compute_waits() || crate::frame::current() < 600) {
+        let frame = crate::frame::current();
+        if p.graphics.is_none() && (compute_waits() || frame < 600) && compute_wait_left(frame) {
+            let started = Instant::now();
             p.make();
+            compute_waited(frame, started.elapsed());
         } else {
-            wait(p, crate::frame::current());
+            wait(p, frame);
         }
     }
     let made = p.made.get()?.as_ref();
@@ -236,6 +239,81 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 fn compute_waits() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_none_or(|v| v != "0"))
+}
+
+/// The most one frame waits in all for the compute pipelines it makes on
+/// the title's thread ([`ready`]): past it, a dispatch whose pipeline is
+/// not made waits within the frame's budget like a draw's and is dropped
+/// while it is not there; a worker goes on making the pipeline, and the
+/// next frame waits again. `VICTORY_PIPELINE_COMPUTE_WAIT_MS` (10,000 by
+/// default; 0: no limit, as before).
+///
+/// Why: on the owner's PC (RTX 4070, cold caches, 2026-11-27) the first
+/// world frame met some 820 shaders and 950 pipelines never seen before.
+/// Its compute pipelines were made one after another on the title's
+/// thread, no frame ended for about 30 s, and the title's own hang
+/// watchdog stopped it with a write to address 0. A dispatch dropped once
+/// may leave a one-shot pass undone for a scene (run 195's blended
+/// windows); a frame held past the watchdog ends the game.
+fn compute_wait_most() -> Option<Duration> {
+    static MOST: OnceLock<Option<Duration>> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        let millis = std::env::var("VICTORY_PIPELINE_COMPUTE_WAIT_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(10_000);
+        tracing::info!(millis, "most a frame waits for compute pipelines (VICTORY_PIPELINE_COMPUTE_WAIT_MS; 0: no limit)");
+        (millis != 0).then(|| Duration::from_millis(millis))
+    })
+}
+
+/// The frame [`compute_wait_most`] is counted for, and what its making of
+/// compute pipelines on the title's threads took so far (summed over
+/// threads: a frame of several recording threads reaches the limit
+/// sooner, never later).
+static COMPUTE_SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+
+/// Whether frame `frame` may still make a compute pipeline on the title's
+/// thread ([`compute_wait_most`]).
+fn compute_wait_left(frame: u64) -> bool {
+    let Some(most) = compute_wait_most() else {
+        return true;
+    };
+    left_in(&COMPUTE_SPENT.lock().unwrap_or_else(|e| e.into_inner()), frame, most)
+}
+
+/// [`compute_wait_left`] on a count `spent` (frame, time) and limit `most`.
+fn left_in(spent: &(u64, Duration), frame: u64, most: Duration) -> bool {
+    spent.0 != frame || spent.1 < most
+}
+
+/// Adds `took` to the count `spent` for frame `frame` (a new frame starts
+/// it again); true if that took it to `most`.
+fn add_to(spent: &mut (u64, Duration), frame: u64, took: Duration, most: Duration) -> bool {
+    if spent.0 != frame {
+        *spent = (frame, Duration::ZERO);
+    }
+    let before = spent.1;
+    spent.1 += took;
+    before < most && spent.1 >= most
+}
+
+/// Frame `frame` made a compute pipeline on the title's thread in `took`;
+/// said once a frame when that reaches [`compute_wait_most`].
+fn compute_waited(frame: u64, took: Duration) {
+    let Some(most) = compute_wait_most() else {
+        return;
+    };
+    let mut spent = COMPUTE_SPENT.lock().unwrap_or_else(|e| e.into_inner());
+    if add_to(&mut spent, frame, took, most) {
+        tracing::warn!(
+            frame,
+            waited_ms = spent.1.as_millis() as u64,
+            "a frame waited this long for compute pipelines made for the first time; its other new ones are waited for within the \
+             frame's budget and their dispatches dropped until made, so that the frame ends before the title's hang watchdog \
+             (VICTORY_PIPELINE_COMPUTE_WAIT_MS)"
+        );
+    }
 }
 
 /// Pipelines made again for the formats bound at a draw, since the start.
@@ -514,6 +592,27 @@ fn drained() {
 
 #[cfg(test)]
 mod tests {
+    use super::{add_to, left_in};
+    use std::time::Duration;
+
+    /// A frame may make compute pipelines on the title's thread until it
+    /// has spent the limit on them; the next frame may again.
+    #[test]
+    fn a_frame_stops_waiting_for_compute_pipelines_at_the_limit() {
+        let most = Duration::from_secs(10);
+        let mut spent = (u64::MAX, Duration::ZERO);
+        assert!(left_in(&spent, 7, most));
+        assert!(!add_to(&mut spent, 7, Duration::from_secs(9), most));
+        assert!(left_in(&spent, 7, most), "under the limit");
+        assert!(add_to(&mut spent, 7, Duration::from_secs(2), most), "said once, when the limit is reached");
+        assert!(!left_in(&spent, 7, most), "past the limit");
+        assert!(!add_to(&mut spent, 7, Duration::from_secs(1), most), "not said again");
+        assert!(left_in(&spent, 8, most), "a new frame waits again");
+        assert!(!add_to(&mut spent, 8, Duration::from_millis(1), most));
+        assert!(left_in(&spent, 8, most));
+    }
+
+
     use super::*;
 
     #[test]
