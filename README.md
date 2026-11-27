@@ -31,7 +31,13 @@ research checklist means what it says.
 > (`VICTORY_TEXTURE_NO_WAIT=0` waits, as before); textures picked by index are uploaded on a thread of their own
 > (`VICTORY_HEAP_WORKER=0` keeps them on the recording thread). Diagnostics: `VICTORY_*_WHY` switches no longer
 > invalidate the shader cache, and `VICTORY_SHADER_FRESH=<hashes>` translates the named shaders anew so their
-> diagnostics print. Research notes: `docs/RESEARCH_CHECKLIST.md`. Results on that PC:
+> diagnostics print (one shader at a time, so their lines no longer interleave).
+> **Faster defaults (`VICTORY_FAST`, on; `=0` puts them all back as in runs 1-9):** the switches the gta6
+> base's tester measured as gains on an RTX 4070 but left off: `VICTORY_ASYNC_SUBMIT`, `VICTORY_QUEUE2=1`,
+> `VICTORY_COPY_PLAIN`, `VICTORY_JOIN_PARTS`, `VICTORY_BACK_OWN_VIEW` (now storing only the words the card
+> changed, as the old path does), `VICTORY_CARD_REHASH_RUNS`, `VICTORY_WIDE_MERGE` (now also on the
+> copy-back thread, run 9's largest cost) and `VICTORY_RECHECK_SOON`; each also takes its own `=0`.
+> Research notes: `docs/RESEARCH_CHECKLIST.md`. Results on that PC:
 > [below](#status-on-the-owners-pc-ryzen-7-5800x--rtx-4070).
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
@@ -79,6 +85,7 @@ status table).
 | 6 | The cutscene and its credits | 0.1–2.8 fps in the world | The CPU no longer pinned (about 6 of 16 processors); all 12 refused pipelines ask for 64-lane waves, which the RTX 4070 does not run; the largest cost a frame is texture refreshes waiting for the game to finish remapping memory (0.4–2.3 s); the card's memory just over its budget | Compute waits on several threads at once share one deadline (two frames had gone 3 s past the limit) |
 | 7 | Further into the cutscene; faces, skin and hair drawn | median 1.5 fps, up to 7.4 fps in the world | With `VICTORY_TEXTURE_NO_WAIT=1`: the remap wait gone (it was up to 8 s a frame); frames with over 300 draws 689 ms median against 2,245 ms in run 6, slowest 2.4 s against 13 s; no texture ever had to be left for a later frame; no frame reached the compute-wait limit. Now the largest costs: the thread that copies the card's results back (330–1,150 ms a frame, mostly its own work) and the heap pass (up to 900 ms) | Texture refreshes no longer wait for remapping, by default |
 | 8 | The cutscene: faces, hair, skin, police lights drawn | 1.7–4.5 fps on the screen, frames of over 300 draws 612 ms median | With `VICTORY_HEAP_WORKER=1`: the heap pass 62 ms median against 154 (slowest 146 against 904); frames of over 300 draws 612 ms median, 1,180 slowest (689 and 2,427 in run 7). Copying back is now the largest cost: 250–314 ms a frame, 50–100 ms of it waiting for the card | The texture worker on by default; the copy-back time split by part in the log; diagnostics that keep the shader cache |
+| 9 | The cutscene again (a diagnostics run: 18 shaders translated anew) | frames of over 300 draws 583 ms median | Copying back split by part: fetching and merging the card's copies is ~all of it, 270 ms a frame median (up to 1 s), about 100 MB in ~1,500 pieces merged one by one on one thread; the PC copies 15 ms. The 13 refused 64-lane programs all keep LDS reads and writes in branches where lanes differ, which no exact 32-lane form handles yet; 2 more refused later (the water programs the base fixed with a paired form); the 5 untranslated ones all read a descriptor (`s_load_dwordx4`, dynamic offset) as data. Five frames waited 10-19 s in all for new compute pipelines (summed over threads) | The faster defaults above; the card copies' merge on several threads; fresh translations one at a time; the compute-wait warning also gives the wait on the clock |
 
 **Why the picture is dark:** the game lights much of its scene with ray tracing (bounce light, lamp
 and sun shadows). With the builder off nothing is traced, so whatever direct light does not reach is
@@ -86,7 +93,14 @@ black (the gta6 base sees the same on its PC, below). Texture slots also wait fo
 (about 20,000 in run 5; run 295 of the base found the same). The black faces of runs 5 and 6 were textures held back by the
 remap wait: drawn in run 7.
 
-**What limits the frame rate now:** CPU-side work after the remap wait was removed (run 7): copying the card's results back into the game's memory, and preparing submissions (each 30–55 ms a part: write-watch, list steps, refreshes, card copies). The card itself is busy only part of each frame.
+**The start screen:** run 1 showed the first-boot screens (accessibility, language, settings) and the
+title screen; later launches skip the first-boot screens. In runs 2-9 the screen stays black for about
+90 s while the game signs in its offline user and loads, then the story starts on its own. The log of
+that stretch shows 6-13 draws a frame at 30 fps, all drawn and none dropped, no refused pipeline and no
+warning: the screen is drawn, but black, and the cause is not found yet. The game's menu in the world is
+the pause menu (Esc).
+
+**What limits the frame rate now:** CPU-side work after the remap wait was removed (run 7): copying the card's results back into the game's memory (run 9: 270 ms a frame, nearly all of it the ~1,500 pieces of the card's buffer copies merged one by one on one thread, now spread over several), and preparing submissions (each 30–55 ms a part: write-watch, list steps, refreshes, card copies). The card itself is busy only part of each frame (about 25 % in run 9's world frames).
 
 ## Status of the gta6 base on its tester's PC (fxceless; inherited, 2026-11-27, 03:45 UTC)
 

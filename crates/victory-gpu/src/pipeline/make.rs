@@ -339,16 +339,22 @@ static COMPUTE_SPENT: Mutex<ComputeBudget> = Mutex::new(ComputeBudget::new());
 /// several recording threads at once each had the whole limit. Run 6 on the
 /// owner's PC: frames 2413 and 2414 waited 12.8 and 13.1 s against 10.
 /// Now a wait that begins while others wait ends with them at the latest.
+///
+/// `spent` sums the waits' own times, so two waits at once count twice:
+/// the frame's `waited_ms` was read as one thread standing 20 s (R51 on
+/// run 9). `first` is when the frame's first wait began, for the time the
+/// waits took on the clock.
 struct ComputeBudget {
     frame: u64,
     spent: Duration,
     waiting: u32,
     deadline: Option<Instant>,
+    first: Option<Instant>,
 }
 
 impl ComputeBudget {
     const fn new() -> Self {
-        Self { frame: u64::MAX, spent: Duration::ZERO, waiting: 0, deadline: None }
+        Self { frame: u64::MAX, spent: Duration::ZERO, waiting: 0, deadline: None, first: None }
     }
 
     /// A wait of frame `frame` begins at `now`: for at most the returned
@@ -367,6 +373,7 @@ impl ComputeBudget {
             return None;
         }
         self.waiting += 1;
+        self.first.get_or_insert(now);
         if self.waiting == 1 {
             self.deadline = Some(now + left);
         }
@@ -407,10 +414,12 @@ fn compute_wait_end(frame: u64, took: Duration) {
     };
     let mut budget = COMPUTE_SPENT.lock().unwrap_or_else(|e| e.into_inner());
     if budget.end(frame, took, most) {
+        let on_the_clock = budget.first.map_or(0, |first| first.elapsed().as_millis() as u64);
         tracing::warn!(
             frame,
             waited_ms = budget.spent.as_millis() as u64,
-            "a frame waited this long for compute pipelines made for the first time; its other new ones are waited for within the \
+            on_the_clock_ms = on_the_clock,
+            "a frame waited this long (waited_ms sums the waits of every thread; on_the_clock_ms is from its first wait's start to now) for compute pipelines made for the first time; its other new ones are waited for within the \
              frame's budget and their dispatches dropped until made, so that the frame ends before the title's hang watchdog \
              (VICTORY_PIPELINE_COMPUTE_WAIT_MS)"
         );

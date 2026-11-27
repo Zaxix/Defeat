@@ -3090,6 +3090,7 @@ fn rehash_runs() -> bool {
     match *MODE.get_or_init(|| match std::env::var("VICTORY_CARD_REHASH_RUNS").as_deref() {
         Ok("1") => 1,
         Ok("alt") => 2,
+        Err(_) if crate::fast::fast() => 1,
         _ => 0,
     }) {
         0 => false,
@@ -3123,7 +3124,105 @@ static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atom
 /// so eight threads take an eighth of them each.
 fn wide_merge() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| crate::fast::on("VICTORY_WIDE_MERGE"))
+}
+
+/// [`Host::relay_card_back`]'s merge with [`wide_merge`]: the fetched
+/// pieces of one landing, `(copy, from, to, offset in the fetch)`, merged
+/// on several threads, each copy's pieces by one of them in their order.
+/// (A copy's merges take its lock, `Shadow::card_merge_relay`; two pieces
+/// of a copy can overlap, and then hold the same fetched bytes.) Copies
+/// that overlap in title memory go to one thread, in their order, so
+/// every title byte keeps the order of its writes. Run 9: about 1,500
+/// pieces (100 MB) a frame merged one after the other on the thread that
+/// lands, 270 ms a frame with its waits. The bytes written.
+fn relay_merge_wide(pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)>, data: usize, after: u64) -> usize {
+    let spans: Vec<(usize, (u64, u64))> = {
+        let mut seen = std::collections::HashSet::new();
+        pieces
+            .iter()
+            .filter(|p| seen.insert(std::sync::Arc::as_ptr(&p.0) as usize))
+            .map(|p| {
+                let (start, len) = p.0.span();
+                (std::sync::Arc::as_ptr(&p.0) as usize, (start, start + len))
+            })
+            .collect()
+    };
+    let cluster = overlap_clusters(spans);
+    let groups = relay_merge_groups(
+        pieces.iter().map(|p| (cluster[&(std::sync::Arc::as_ptr(&p.0) as usize)], (p.2 - p.1) as u64)),
+        8,
+    );
+    let mut pieces: Vec<Option<_>> = pieces.into_iter().map(Some).collect();
+    let written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let jobs: Vec<Box<dyn FnOnce() + Send>> = groups
+        .into_iter()
+        .map(|group| {
+            let mine: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> =
+                group.into_iter().filter_map(|i| pieces[i].take()).collect();
+            let written = written.clone();
+            Box::new(move || {
+                let mut title = Vec::new();
+                let mut sum = 0;
+                for (shadow, lo, hi, at) in mine {
+                    // SAFETY: the mapping of the fetched bytes; the copy
+                    // into it has run, and the caller waits for this job.
+                    let gpu = unsafe { std::slice::from_raw_parts((data + at as usize) as *const u8, hi - lo) };
+                    let merged = shadow.card_merge_relay(lo, gpu, after, &mut title);
+                    shadow.walls_merged(gpu.len(), merged);
+                    sum += merged;
+                }
+                written.fetch_add(sum as u64, Ordering::Relaxed);
+            }) as Box<dyn FnOnce() + Send>
+        })
+        .collect();
+    crate::shadow::wide_run(jobs);
+    written.load(Ordering::Relaxed) as usize
+}
+
+/// For copies `(key, (start, end))`: a number per key, the same for keys
+/// whose spans overlap, directly or through others.
+fn overlap_clusters(mut spans: Vec<(usize, (u64, u64))>) -> std::collections::HashMap<usize, usize> {
+    spans.sort_by_key(|s| s.1);
+    let mut out = std::collections::HashMap::new();
+    let (mut id, mut end) = (0usize, None::<u64>);
+    for (key, (a, b)) in spans {
+        match end {
+            Some(e) if a < e => end = Some(e.max(b)),
+            Some(_) => {
+                id += 1;
+                end = Some(b);
+            }
+            None => end = Some(b),
+        }
+        out.insert(key, id);
+    }
+    out
+}
+
+/// The pieces `(group key, bytes)` in at most `most` groups of their
+/// indices: every piece of a key in one group, in their order; the keys
+/// given out biggest first, each to the group with the fewest bytes so far.
+fn relay_merge_groups(pieces: impl Iterator<Item = (usize, u64)>, most: usize) -> Vec<Vec<usize>> {
+    let mut keys: Vec<(u64, Vec<usize>)> = Vec::new();
+    let mut at: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (i, (key, bytes)) in pieces.enumerate() {
+        let k = *at.entry(key).or_insert_with(|| {
+            keys.push((0, Vec::new()));
+            keys.len() - 1
+        });
+        keys[k].0 += bytes;
+        keys[k].1.push(i);
+    }
+    keys.sort_by_key(|k| std::cmp::Reverse(k.0));
+    let n = most.clamp(1, keys.len().max(1));
+    let mut groups: Vec<(u64, Vec<usize>)> = vec![(0, Vec::new()); n];
+    for (bytes, list) in keys {
+        let least = groups.iter_mut().min_by_key(|g| g.0).expect("at least one group");
+        least.0 += bytes;
+        least.1.extend(list);
+    }
+    groups.into_iter().map(|g| g.1).filter(|g| !g.is_empty()).collect()
 }
 
 /// One declared range of a copy in the card's memory, in a submission.
@@ -3634,7 +3733,41 @@ fn note_beside(noted: &mut std::collections::HashMap<(usize, u32), u64>, fetched
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{fetched_beside, flagged_pieces, landable, note_beside};
+    use super::{fetched_beside, flagged_pieces, landable, note_beside, overlap_clusters, relay_merge_groups};
+
+    /// Every piece goes to one group, a key's pieces all to the same one
+    /// in their order, and no more groups than asked for.
+    #[test]
+    fn a_landing_is_merged_in_groups_that_keep_a_copys_order() {
+        let pieces = [(1usize, 10u64), (2, 100), (1, 10), (3, 50), (2, 100), (4, 5), (1, 10)];
+        let groups = relay_merge_groups(pieces.iter().copied(), 2);
+        assert!(groups.len() <= 2);
+        let mut all: Vec<usize> = groups.iter().flatten().copied().collect();
+        all.sort_unstable();
+        assert_eq!(all, (0..pieces.len()).collect::<Vec<_>>());
+        for key in [1usize, 2, 3, 4] {
+            let holding: Vec<&Vec<usize>> = groups.iter().filter(|g| g.iter().any(|&i| pieces[i].0 == key)).collect();
+            assert_eq!(holding.len(), 1, "key {key} split");
+            let order: Vec<usize> = holding[0].iter().copied().filter(|&i| pieces[i].0 == key).collect();
+            assert!(order.windows(2).all(|w| w[0] < w[1]), "key {key} out of order");
+        }
+        // The biggest key (2, 200 bytes) has a group to itself.
+        assert!(groups.iter().any(|g| g.iter().all(|&i| pieces[i].0 == 2)));
+        assert_eq!(relay_merge_groups(std::iter::empty(), 8), Vec::<Vec<usize>>::new());
+        assert_eq!(relay_merge_groups([(9usize, 1u64)].into_iter(), 0), vec![vec![0]]);
+    }
+
+    /// Copies that overlap in title memory, directly or through another,
+    /// get one number; copies that only touch do not.
+    #[test]
+    fn overlapping_copies_are_merged_by_one_thread() {
+        let c = overlap_clusters(vec![(1, (0, 100)), (2, (50, 150)), (3, (140, 200)), (4, (200, 300)), (5, (1000, 1001))]);
+        assert_eq!(c[&1], c[&2]);
+        assert_eq!(c[&2], c[&3]);
+        assert_ne!(c[&3], c[&4]);
+        assert_ne!(c[&4], c[&5]);
+        assert_eq!(c.len(), 5);
+    }
 
     /// A piece fetched on the copy queue while a later flight was in the
     /// air is fetched again by that flight, and by no flight sent after
@@ -6730,16 +6863,21 @@ impl Host {
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
-        let mut title = Vec::new();
-        let mut written = 0;
-        for (shadow, lo, hi, at) in &pieces {
-            // SAFETY: the mapping of the fetched bytes, `total` of them;
-            // the copy into it has run.
-            let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
-            shadow.walls_merged(gpu.len(), merged);
-            written += merged;
-        }
+        let written = if wide_merge() && pieces.len() >= 8 {
+            relay_merge_wide(pieces, data, after)
+        } else {
+            let mut title = Vec::new();
+            let mut written = 0;
+            for (shadow, lo, hi, at) in &pieces {
+                // SAFETY: the mapping of the fetched bytes, `total` of them;
+                // the copy into it has run.
+                let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
+                let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
+                shadow.walls_merged(gpu.len(), merged);
+                written += merged;
+            }
+            written
+        };
         copy_back(1, written as u64);
         // Sends up to `after` are of no use to any later merge; with the
         // fetch inside flights only those up to these plans' are
