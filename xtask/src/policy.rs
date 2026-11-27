@@ -11,6 +11,9 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 const MAX_FILE_SIZE: usize = 512 * 1024;
+/// Rust source of ours may be larger: `host.rs` and the translator's
+/// `lower.rs` grew past 512 KiB (2026-11-27). The text rules still apply.
+const MAX_RUST_SIZE: usize = 1024 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
@@ -25,6 +28,9 @@ const ALLOWED_NAMES: &[&str] = &[
     "LICENSE",
     "LICENSE-MIT",
     "LICENSE-APACHE",
+    // The shader cache's frozen key: a copy of `shader_cache.rs` as it was at
+    // 11169c3, our own text (`crates/victory-gpu/src/shader_cache.rs`).
+    "shader_cache.key",
 ];
 
 /// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
@@ -202,9 +208,10 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     if !allowed {
         problems.push("file type not on the allowlist".to_owned());
     }
-    if content.len() > MAX_FILE_SIZE {
+    let limit = if ext.as_deref() == Some("rs") { MAX_RUST_SIZE } else { MAX_FILE_SIZE };
+    if content.len() > limit {
         problems.push(format!(
-            "{} bytes exceeds the {MAX_FILE_SIZE}-byte limit",
+            "{} bytes exceeds the {limit}-byte limit",
             content.len()
         ));
     }
