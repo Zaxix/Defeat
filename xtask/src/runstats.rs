@@ -53,6 +53,9 @@ struct Frame {
     idle_submitting: Option<f64>,
     /// From the nearest merges-by-part line: written back (all threads).
     written_back: Option<f64>,
+    /// From the nearest card meter line (`VICTORY_CARD_METER=1`): a list
+    /// of ours running on the card, by its own clock.
+    card_running: Option<f64>,
 }
 
 /// What a run log says.
@@ -71,7 +74,22 @@ struct Run {
     guards: Vec<(f64, f64)>,
     /// The latest guards' lock line's "held longest" list.
     guards_last: Option<String>,
+    /// DirectStorage's split of requests of 250 ms or more: (count, the
+    /// six parts' averages, ms).
+    storage_parts: Vec<(f64, [f64; 6])>,
+    /// `VICTORY_READBACK_REUSE=1`: (all, again untouched, touched, first) MB a frame.
+    reuse: Vec<[f64; 4]>,
 }
+
+/// The parts of the storage split, as its line names them.
+const STORAGE_PARTS: [&str; 6] = [
+    "waiting for a worker ",
+    "reading the file ",
+    "the GPU side told before the write ",
+    "decoding or copying ",
+    "told after (and physical pages written) ",
+    "the rest ",
+];
 
 pub fn run(paths: &[std::path::PathBuf], guard_s: f64) -> Result<()> {
     anyhow::ensure!(!paths.is_empty(), "name one or more run logs (run15.txt ...)");
@@ -144,6 +162,7 @@ fn parse(text: &str) -> Run {
     // Per-second lines, joined afterwards: (time, a, b).
     let mut clock: Vec<(f64, f64, f64)> = Vec::new();
     let mut merges: Vec<(f64, f64)> = Vec::new();
+    let mut meter: Vec<(f64, f64, f64)> = Vec::new();
     for raw in text.lines() {
         let line = plain(raw);
         if let Some(rest) = line.strip_prefix("source ") {
@@ -174,6 +193,23 @@ fn parse(text: &str) -> Run {
             {
                 clock.push((at, idle, busy));
             }
+        } else if line.contains("the card per frame (") && line.contains("a list of ours running ") {
+            if let Some(running) = after(&line, "a list of ours running ") {
+                meter.push((at, running, 0.0));
+            }
+        } else if line.contains("dstorage, where the time went") {
+            if let Some(i) = line.find("requests of 250 ms or more, on average: ") {
+                let tail = &line[i..];
+                let n = before(&line[..i + 8], " requests").unwrap_or(0.0);
+                let parts = STORAGE_PARTS.map(|key| after(tail, key).unwrap_or(0.0));
+                run.storage_parts.push((n, parts));
+            }
+        } else if line.contains("write-backs through our own views per frame (VICTORY_READBACK_REUSE=1): ") {
+            let all = after(&line, "(VICTORY_READBACK_REUSE=1): ").unwrap_or(0.0);
+            let again = after(&line, " MB; ").unwrap_or(0.0);
+            let touched = after(&line, "so at most this much could wait for a read), ").unwrap_or(0.0);
+            let first = after(&line, "(by the title or another copy), ").unwrap_or(0.0);
+            run.reuse.push([all, again, touched, first]);
         } else if line.contains("the card copies' merges by part") {
             // "written back 139.2" (run 14) or "; written back 91.3 (" (run 15 on).
             if let Some(w) = after(&line, "written back ") {
@@ -232,6 +268,12 @@ fn parse(text: &str) -> Run {
             f.idle_submitting = Some(busy);
         }
         f.written_back = nearest(f.at, &merges3).map(|m| m.0);
+        // The meter's line comes every 5 s: up to 5 s away.
+        f.card_running = meter
+            .iter()
+            .filter(|r| (r.0 - f.at).abs() <= 5.0)
+            .min_by(|a, b| (a.0 - f.at).abs().total_cmp(&(b.0 - f.at).abs()))
+            .map(|r| r.1);
     }
     run
 }
@@ -260,7 +302,7 @@ fn row(name: &str, frames: &[&Frame]) -> String {
     let p50 = quantile(&mut ms, 0.5).unwrap_or(0.0);
     let p90 = quantile(&mut ms, 0.9).unwrap_or(0.0);
     format!(
-        "  {name:<30} N={:<4} frame p50 {p50:>6.1} ms ({:>4.1} fps, {:>3.0} % of 30) p90 {p90:>6.1} | draws {:>6} | preparing {:>6} copies {:>5} ms {:>5} MB | copying back {:>6} | card idle {:>6} (behind us {:>6}) | written back, all threads {:>6} | dropped {:>5}\n",
+        "  {name:<30} N={:<4} frame p50 {p50:>6.1} ms ({:>4.1} fps, {:>3.0} % of 30) p90 {p90:>6.1} | draws {:>6} | preparing {:>6} copies {:>5} ms {:>5} MB | copying back {:>6} | card idle {:>6} (behind us {:>6}) busy {:>6} | written back, all threads {:>6} | dropped {:>5}\n",
         frames.len(),
         1000.0 / p50.max(1e-9),
         100.0 * 1000.0 / p50.max(1e-9) / 30.0,
@@ -271,6 +313,7 @@ fn row(name: &str, frames: &[&Frame]) -> String {
         median_of(frames, |f| Some(f.back_ms)),
         median_of(frames, |f| f.idle),
         median_of(frames, |f| f.idle_submitting),
+        median_of(frames, |f| f.card_running),
         median_of(frames, |f| f.written_back),
         median_of(frames, |f| Some(f.dropped)),
     )
@@ -346,6 +389,32 @@ fn report(path: &Path, run: &Run, guard_s: f64) -> String {
             run.storage.iter().map(|s| s.2).sum::<f64>(),
         ));
     }
+    if !run.storage_parts.is_empty() {
+        // Weighted by the requests each line averaged.
+        let n: f64 = run.storage_parts.iter().map(|p| p.0).sum();
+        let avg: Vec<String> = STORAGE_PARTS
+            .iter()
+            .enumerate()
+            .map(|(k, name)| {
+                let sum: f64 = run.storage_parts.iter().map(|p| p.0 * p.1[k]).sum();
+                format!("{}{:.0}", name, sum / n.max(1.0))
+            })
+            .collect();
+        out.push_str(&format!("  storage requests of 250 ms or more ({n:.0}), on average, ms: {}\n", avg.join(", ")));
+    }
+    if !run.reuse.is_empty() {
+        let col = |k: usize| {
+            let mut v: Vec<f64> = run.reuse.iter().map(|r| r[k]).collect();
+            quantile(&mut v, 0.5).unwrap_or(0.0)
+        };
+        out.push_str(&format!(
+            "  write-backs through our own views, MB a frame (medians): {:.1}; onto pages the card wrote again with nothing between {:.1}, written since {:.1}, first {:.1}\n",
+            col(0),
+            col(1),
+            col(2),
+            col(3)
+        ));
+    }
     if !run.guards.is_empty() {
         let mut w: Vec<f64> = run.guards.iter().map(|g| g.0).collect();
         let mut h: Vec<f64> = run.guards.iter().map(|g| g.1).collect();
@@ -399,6 +468,18 @@ switches       VICTORY_BVH_BUILDER=0 VICTORY_WRITE_PLAIN=alt\n\
             ]
         );
         assert_eq!(run.vram, [(stamp("2026-11-28T00:37:23.234922Z").unwrap(), 10222.0, 10781.0)]);
+    }
+
+    #[test]
+    fn the_meter_storage_split_and_reuse_lines_are_read() {
+        let log = "2026-11-28T00:28:52.000000Z  INFO victory_gpu::host: 5.2 fps, 193.0 ms/frame (90.6 preparing: copies 40.0 ms 70.5 MB, textures 5.0 ms 20.0 MB; 0.0 on the GPU; 66.5 copying back 60.0 MB), 5568 draws/frame, dropped 390 without\n\
+2026-11-28T00:28:55.000000Z  INFO victory_gpu::cardmeter: the card per frame (25 frames, the direct queue by its own clock): a list of ours running 61.5 ms (the lists' stamps add to 70.1 ms; 300 lists); no list\n\
+2026-11-28T00:28:57.000000Z  INFO victory_hle::modules::dstorage: dstorage, where the time went, ms: the slowest request (its run; the wait before it apart): waiting for a worker 0, reading the file 0, the GPU side told before the write 0, decoding or copying 0, told after (and physical pages written) 0, the rest 0; the 10 requests of 250 ms or more, on average: waiting for a worker 2000, reading the file 1, the GPU side told before the write 300, decoding or copying 2, told after (and physical pages written) 200, the rest 0\n\
+2026-11-28T00:28:58.000000Z  INFO victory_gpu::shadow: write-backs through our own views per frame (VICTORY_READBACK_REUSE=1): 30.0 MB; 12.0 MB onto pages whose last write was our own write-back (the card wrote them again with nothing written between: the title read them or not, reads are not seen, so at most this much could wait for a read), 15.0 MB onto pages written since (by the title or another copy), 3.0 MB onto pages not written back before\n";
+        let run = parse(log);
+        assert_eq!(run.frames[0].card_running, Some(61.5));
+        assert_eq!(run.storage_parts, [(10.0, [2000.0, 1.0, 300.0, 2.0, 200.0, 0.0])]);
+        assert_eq!(run.reuse, [[30.0, 12.0, 15.0, 3.0]]);
     }
 
     #[test]

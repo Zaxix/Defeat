@@ -1458,6 +1458,65 @@ fn write_merged(address: usize, read: Option<&[u8]>, merged: &[u8]) -> usize {
     }
 }
 
+/// Whether the write-backs through our own views are sorted by what
+/// happened to their page since the last one (`VICTORY_READBACK_REUSE=1`;
+/// off by default): research R65/A, how much of what the card wrote is
+/// written over by the card again before anything else touches it.
+fn readback_reuse_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_READBACK_REUSE").is_some_and(|v| v == "1"))
+}
+
+/// By 64 KiB page, the journal's asking our last write-back through our
+/// own view stamped it with; in shards by page.
+static REUSE_PAGES: [Mutex<Option<std::collections::HashMap<usize, u64>>>; 16] = [const { Mutex::new(None) }; 16];
+
+/// Since the last line: bytes written back onto a page whose last stamp
+/// was our own write-back (nothing written there since: no title write
+/// the write watch saw, no other write-back), onto a page written since,
+/// and onto a page not written back before.
+static REUSE_BYTES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// With [`readback_reuse_on`]: a write-back through our own view of
+/// `bytes` into `page`, which the journal had last found written at
+/// asking `before` and now stamps `now` ([`crate::watch::wrote_own`]).
+///
+/// A page the card writes again with nothing written in between is one
+/// whose earlier write-back the title may never have read: what it read
+/// is not seen (reads do not fault), so this is the most that could be
+/// saved by not copying back until a read, not what would be.
+fn readback_reuse(page: usize, before: u64, now: u64, bytes: usize) {
+    if !readback_reuse_on() {
+        return;
+    }
+    let mut shard = REUSE_PAGES[page % 16].lock().unwrap_or_else(|e| e.into_inner());
+    let map = shard.get_or_insert_with(Default::default);
+    if map.len() >= 1 << 18 {
+        map.clear();
+    }
+    let kind = match map.insert(page, now) {
+        Some(ours) if ours == before => 0,
+        Some(_) => 1,
+        None => 2,
+    };
+    REUSE_BYTES[kind].fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+/// With the frame line: [`readback_reuse`]'s sums per frame.
+pub(crate) fn readback_reuse_line(frames: f64) {
+    if !readback_reuse_on() {
+        return;
+    }
+    let [again, touched, first] = [0, 1, 2].map(|i| REUSE_BYTES[i].swap(0, Ordering::Relaxed) as f64 / frames / 1e6);
+    tracing::info!(
+        "write-backs through our own views per frame (VICTORY_READBACK_REUSE=1): {:.1} MB; {again:.1} MB onto pages whose \
+         last write was our own write-back (the card wrote them again with nothing written between: the title read them \
+         or not, reads are not seen, so at most this much could wait for a read), {touched:.1} MB onto pages written since \
+         (by the title or another copy), {first:.1} MB onto pages not written back before",
+        again + touched + first
+    );
+}
+
 /// [`write_merged`], also giving the number of writes it made.
 fn write_merged_counted(address: usize, read: Option<&[u8]>, merged: &[u8]) -> (usize, u64) {
     match read {
@@ -4043,6 +4102,7 @@ impl Shadow {
         let page = at / PAGE;
         let others: Vec<usize> = shown.iter().map(|&a| a / PAGE).filter(|&p| p != page).collect();
         let (before, now) = crate::watch::wrote_own(page, &others);
+        readback_reuse(page, before, now, bytes.len());
         // A placed texture there changed with no descriptor written (what
         // `crate::watch::writing` tells the texture table on the old way).
         crate::descriptor::host::remapped(at, bytes.len());

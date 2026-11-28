@@ -11161,6 +11161,7 @@ impl Meter {
         crate::plaincopy::line(frames);
         crate::plaincopy::store_line(frames);
         crate::watch::guards_line(frames);
+        crate::shadow::readback_reuse_line(frames);
         #[cfg(feature = "diagnostics")]
         crate::backreads::line(frames);
         crate::shadow::placed_line();

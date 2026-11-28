@@ -764,6 +764,12 @@ const LONG_MOST: usize = 8;
 /// thread that made it.
 pub fn frame() {
     if !on() {
+        // `VICTORY_CARD_METER=1` in a release build, where frames are not
+        // logged: its stamps are read and its lines said all the same
+        // (they were only read here, so the switch did nothing alone).
+        if crate::cardmeter::on() {
+            crate::cardmeter::collect();
+        }
         return;
     }
     crate::cardmeter::collect();
