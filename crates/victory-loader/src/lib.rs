@@ -23,6 +23,7 @@
 
 #[cfg(windows)]
 mod console_insn;
+mod counted;
 mod crash;
 pub mod prepare;
 pub mod resolve;
@@ -43,6 +44,7 @@ pub use crash::{
 };
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use crash::save_on_crash;
+pub use counted::{Counting, count_calls_into, counted_calls, counting_calls};
 pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
 #[cfg(all(windows, feature = "diagnostics"))]

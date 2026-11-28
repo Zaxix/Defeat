@@ -153,6 +153,7 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
         module
     };
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
+        note_title_lookup(module, name);
         return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
     };
     // Values below 0x10000 are ordinals; we export by name only.
@@ -173,6 +174,29 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
             std::ptr::null_mut()
         }
     }
+}
+
+/// Logs, once per name, a lookup by name in one of the title's own images:
+/// functions reached that way bypass import binding, so the counting of
+/// `VICTORY_TITLE_CALLS` would not see them (e.g. the FidelityFX loader's
+/// `ffx*` entries).
+fn note_title_lookup(module: *mut c_void, name: *const u8) {
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    if (name as usize) < 0x1_0000 {
+        return;
+    }
+    let Some(path) = runtime::image_path(module as usize) else {
+        return;
+    };
+    // SAFETY: not an ordinal, so the title passes a NUL-terminated name.
+    let name = unsafe { CStr::from_ptr(name.cast()) }.to_string_lossy();
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.iter().any(|s| *s == name) {
+        return;
+    }
+    seen.push(name.to_string());
+    let image = path.file_name().unwrap_or_default().to_string_lossy();
+    tracing::info!(%image, %name, "the title looked a function of its own up by name");
 }
 
 /// What a host module's `name` (or ordinal) is bound to at import binding

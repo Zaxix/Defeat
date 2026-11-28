@@ -99,6 +99,8 @@ pub fn run(
         inner: &resolver,
         dlls: &dlls,
     };
+    victory_loader::count_calls_into(&title_calls_watched());
+    let with_dlls = victory_loader::Counting { inner: &with_dlls };
     let show = |name: &str, report: BindReport| {
         println!(
             "bound          {name}: {} hle, {} host, {} title, {} missing",
@@ -116,6 +118,7 @@ pub fn run(
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
     show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    report_title_calls();
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());
@@ -199,6 +202,63 @@ fn watch(base: usize, size: usize) {
     });
 }
 
+/// `VICTORY_TITLE_CALLS`: title DLLs whose functions the title's calls are
+/// counted into (comma-separated); `1` is the FidelityFX loader, the
+/// upscaler's entry (R70/P0-A). Off by default; changes nothing the calls do.
+#[cfg(windows)]
+fn title_calls_watched() -> Vec<String> {
+    let value = std::env::var("VICTORY_TITLE_CALLS").unwrap_or_default();
+    match value.trim() {
+        "" | "0" => Vec::new(),
+        "1" => vec!["amd_fidelityfx_loader_xbox.dll".to_owned()],
+        list => list
+            .split(',')
+            .map(|d| d.trim().to_owned())
+            .filter(|d| !d.is_empty())
+            .collect(),
+    }
+}
+
+/// With `VICTORY_TITLE_CALLS`: names what is counted, then every 10 s the
+/// functions whose count moved (the line says so once if none ever did).
+#[cfg(windows)]
+fn report_title_calls() {
+    if !victory_loader::counting_calls() {
+        return;
+    }
+    let counted = victory_loader::counted_calls();
+    let names: Vec<_> = counted.iter().map(|(n, _)| n.as_str()).collect();
+    println!(
+        "title calls    counting {} imports: {}",
+        names.len(),
+        names.join(", ")
+    );
+    std::thread::spawn(|| {
+        let mut last: Vec<(String, u64)> = Vec::new();
+        let started = std::time::Instant::now();
+        let mut said_none = false;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            let now = victory_loader::counted_calls();
+            let at = started.elapsed().as_secs();
+            for (name, calls) in &now {
+                let before = last.iter().find(|(n, _)| n == name).map_or(0, |(_, c)| *c);
+                if *calls != before {
+                    println!(
+                        "title calls    {at:>5} s  {name}: {calls} (+{} in 10 s)",
+                        calls - before
+                    );
+                }
+            }
+            if !said_none && at >= 120 && now.iter().all(|(_, c)| *c == 0) {
+                println!("title calls    none in the first {at} s");
+                said_none = true;
+            }
+            last = now;
+        }
+    });
+}
+
 /// DLLs the host or our runtime provide are never taken from the title.
 #[cfg(windows)]
 fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
@@ -254,6 +314,7 @@ impl LateDlls {
                     inner: &old,
                     dlls: &new,
                 };
+                let resolver = victory_loader::Counting { inner: &resolver };
                 for (name, dll) in &new {
                     println!(
                         "title dll      {name} at {:#x} (loaded by the title)",
