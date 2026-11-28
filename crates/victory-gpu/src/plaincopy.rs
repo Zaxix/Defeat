@@ -314,7 +314,7 @@ pub(crate) fn store_on() -> bool {
         1 => true,
         _ => {
             static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 0;
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20).is_multiple_of(2);
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(on), Relaxed) != u8::from(on) {
                 tracing::info!(
