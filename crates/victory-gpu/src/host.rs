@@ -5343,16 +5343,23 @@ fn late_line(frames: f64) {
              {scan:.1}, reading title memory and writing the GPU's bytes into it {sync:.1}; any thread), read-backs {read_backs:.1}, card copies' checks after their \
              flights {checks:.1}"
         );
-        let m = [0, 1, 2, 3, 4, 5].map(|i| crate::shadow::MERGE_PARTS[i].swap(0, Ordering::Relaxed) as f64 / frames / 1e6);
+        let m = [0, 1, 2, 3, 4, 5, 6, 7, 8].map(|i| crate::shadow::MERGE_PARTS[i].swap(0, Ordering::Relaxed) as f64 / frames / 1e6);
+        let runs = crate::shadow::MERGE_RUNS.swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(
             "the card copies' merges by part, ms per frame (any thread): the copy's merge lock waited for {:.1}, what the card changed \
-             found {:.1}, the title's bytes sent since gathered {:.1}, title memory read {:.1}, merged {:.1}, written back {:.1}",
+             found {:.1}, the title's bytes sent since gathered {:.1}, title memory read {:.1}, merged {:.1}; written back {:.1} \
+             (the fills read ahead told {:.1}, through a view of our own or its try {:.1}, the old way's guards opened {:.1}, the \
+             old way's writes {:.1} for {runs:.0} runs of words)",
             m[0],
             m[1],
             m[2],
             m[3],
             m[4],
-            m[5]
+            m[5] + m[6] + m[7] + m[8],
+            m[5],
+            m[6],
+            m[7],
+            m[8]
         );
         if inflight_fetch() {
             let i: Vec<f64> = INFLIGHT_STATS.iter().map(|i| i.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -10885,6 +10892,12 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     #[cfg(feature = "diagnostics")]
     crate::backreads::touched(dst as usize, len, true);
+    // In place first (`VICTORY_WRITE_PLAIN`): a page that is not there or
+    // not writable makes it give up, and the kernel's write below takes
+    // the whole of it, as before.
+    if crate::plaincopy::store(dst, src, len) {
+        return;
+    }
     let direct = direct_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
@@ -11146,6 +11159,7 @@ impl Meter {
         card_clock_line(frames, ms);
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);
+        crate::plaincopy::store_line(frames);
         #[cfg(feature = "diagnostics")]
         crate::backreads::line(frames);
         crate::shadow::placed_line();

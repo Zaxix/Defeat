@@ -45,6 +45,28 @@ core::arch::global_asm!(
     "    mov rdi, r10",
     "    xor eax, eax",
     "    ret",
+    // The same copy for stores INTO title memory ([`store`]): its own
+    // instruction, so the handler can tell the two apart.
+    ".globl victory_store_guarded",
+    ".globl victory_store_guarded_at",
+    ".globl victory_store_guarded_fault",
+    "victory_store_guarded:",
+    "    mov r9, rsi",
+    "    mov r10, rdi",
+    "    mov rdi, rcx",
+    "    mov rsi, rdx",
+    "    mov rcx, r8",
+    "victory_store_guarded_at:",
+    "    rep movsb",
+    "    mov rsi, r9",
+    "    mov rdi, r10",
+    "    mov eax, 1",
+    "    ret",
+    "victory_store_guarded_fault:",
+    "    mov rsi, r9",
+    "    mov rdi, r10",
+    "    xor eax, eax",
+    "    ret",
 );
 
 #[cfg(target_arch = "x86_64")]
@@ -52,6 +74,9 @@ unsafe extern "C" {
     fn victory_copy_guarded(to: *mut u8, from: *const u8, len: usize) -> u32;
     static victory_copy_guarded_at: u8;
     static victory_copy_guarded_fault: u8;
+    fn victory_store_guarded(to: *mut u8, from: *const u8, len: usize) -> u32;
+    static victory_store_guarded_at: u8;
+    static victory_store_guarded_fault: u8;
 }
 
 /// Whether copies of title memory into host memory are made in place
@@ -141,6 +166,20 @@ fn install() {
         // SAFETY: the system passes the exception being dispatched and the
         // context it will continue with.
         let (r, context) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
+        // A store into title memory ([`store`]): its source is host
+        // memory, always there, so any fault is the destination's (a page
+        // not committed, or read-only): the store gives up and the caller
+        // goes to the kernel's write, which leaves such a page alone.
+        if context.Rip == (&raw const victory_store_guarded_at) as u64 {
+            if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION
+                || r.ExceptionCode == EXCEPTION_IN_PAGE_ERROR
+                || r.ExceptionCode == EXCEPTION_GUARD_PAGE
+            {
+                context.Rip = (&raw const victory_store_guarded_fault) as u64;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
         // Only at the copy's own instruction.
         if context.Rip != (&raw const victory_copy_guarded_at) as u64 {
             return EXCEPTION_CONTINUE_SEARCH;
@@ -236,6 +275,122 @@ pub(crate) fn copy_short(to: *mut u8, from: *const u8, len: usize) -> bool {
         note_fault(from as usize, len);
     }
     whole
+}
+
+/// Whether what shaders wrote is stored into title memory in place
+/// (`VICTORY_WRITE_PLAIN`; on with the faster defaults, `=0` off, `alt`
+/// twenty seconds each way in turn), with the kernel's write behind it for
+/// a page that is not there or not writable.
+///
+/// Run 14 on the owner's PC: the card copies' merges spent 139 ms a frame
+/// (all threads) writing back, and 60 % of their stretches went the old
+/// way: one `NtWriteVirtualMemory` for each run of words the card changed,
+/// a system call that locks and probes the page every time, where the
+/// processor's own store of those words takes nanoseconds.
+pub(crate) fn store_on() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| {
+        let mode = match std::env::var("VICTORY_WRITE_PLAIN").as_deref() {
+            Ok("alt") => 2,
+            Ok("0") | Ok("") => 0,
+            Ok(_) => 1,
+            Err(_) => u8::from(crate::fast::fast()),
+        };
+        if cfg!(not(target_arch = "x86_64")) {
+            return 0;
+        }
+        if mode != 0 {
+            install();
+        }
+        tracing::info!(
+            "what shaders wrote is stored into title memory {} (VICTORY_WRITE_PLAIN: 0 through the kernel, alt in turn)",
+            ["through the kernel's write, as before", "in place, the kernel's write behind it for a page that is not there", "in place and through the kernel in turn, twenty seconds each"][usize::from(mode)]
+        );
+        mode
+    });
+    match mode {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 0;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "what shaders wrote is stored into title memory from now (VICTORY_WRITE_PLAIN=alt): {}",
+                    if on { "IN PLACE" } else { "through the kernel" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Since the last line: stores made in place, their bytes, and those that
+/// met a page that was not there or not writable (then written by the
+/// kernel); stores not tried because their page faulted lately.
+static STORES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// The 64 KiB blocks a store in place faulted in lately, as [`RECENT`]
+/// for reads (a page the title has unmapped stays so a while).
+static STORE_RECENT: [std::sync::atomic::AtomicUsize; 1024] = [const { std::sync::atomic::AtomicUsize::new(0) }; 1024];
+static STORE_EMPTIED: AtomicU64 = AtomicU64::new(0);
+
+/// With [`store_on`]: stores `len` bytes of host memory at `from` into
+/// title memory at `to`, in place; false if it is off, or a page of `to`
+/// was not there or not writable (some of it may have been written: the
+/// caller writes it all again through the kernel, as before).
+///
+/// `from` must be `len` readable bytes of host memory. The caller has
+/// opened the write-watch guards of `to` (`crate::watch::writing`); a
+/// guard still closed faults here and the kernel's write takes it.
+pub(crate) fn store(to: *mut u8, from: *const u8, len: usize) -> bool {
+    if len == 0 || !store_on() {
+        return false;
+    }
+    let now = now_ms();
+    let emptied = STORE_EMPTIED.load(Relaxed);
+    if now.saturating_sub(emptied) >= 2_000 && STORE_EMPTIED.compare_exchange(emptied, now, Relaxed, Relaxed).is_ok() {
+        for place in &STORE_RECENT {
+            place.store(0, Relaxed);
+        }
+    }
+    let (first, last) = blocks(to as usize, len);
+    if STORE_RECENT[first & 1023].load(Relaxed) == first || STORE_RECENT[last & 1023].load(Relaxed) == last {
+        STORES[3].fetch_add(1, Relaxed);
+        return false;
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: the source is the caller's host memory; a destination page
+    // that is not there or not writable ends the store with 0 instead of a
+    // fault ([`install`]).
+    let whole = unsafe { victory_store_guarded(to, from, len) != 0 };
+    #[cfg(not(target_arch = "x86_64"))]
+    let whole = false;
+    if whole {
+        STORES[0].fetch_add(1, Relaxed);
+        STORES[1].fetch_add(len as u64, Relaxed);
+    } else {
+        STORES[2].fetch_add(1, Relaxed);
+        STORE_RECENT[first & 1023].store(first, Relaxed);
+        STORE_RECENT[last & 1023].store(last, Relaxed);
+    }
+    whole
+}
+
+/// With the frame line: what [`store`] did per frame over `frames`.
+pub(crate) fn store_line(frames: f64) {
+    let [stores, bytes, gone, lately] = [0, 1, 2, 3].map(|i| STORES[i].swap(0, Relaxed) as f64 / frames);
+    if stores + gone + lately == 0.0 {
+        return;
+    }
+    tracing::info!(
+        "what shaders wrote, stored into title memory in place per frame (VICTORY_WRITE_PLAIN): {stores:.0}, {:.1} MB; \
+         {gone:.1} met a page that was not there or not writable and went through the kernel's write; {lately:.0} not \
+         tried, their page having faulted in the last two seconds",
+        bytes / 1e6
+    );
 }
 
 /// The fewest bytes [`copy`] takes: what is shorter is [`copy_short`]'s,

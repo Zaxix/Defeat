@@ -1450,6 +1450,23 @@ fn write_merged(address: usize, read: Option<&[u8]>, merged: &[u8]) -> usize {
     }
 }
 
+/// [`write_merged`], also giving the number of writes it made.
+fn write_merged_counted(address: usize, read: Option<&[u8]>, merged: &[u8]) -> (usize, u64) {
+    match read {
+        Some(read) if merge_words_on() => {
+            let (mut written, mut runs) = (0, 0);
+            word_runs(address, read, merged, |off, len| {
+                crate::host::write_mapped((address + off) as *mut u8, merged[off..].as_ptr(), len);
+                crate::gpu_access::note_gpu_write(address + off, len);
+                written += len;
+                runs += 1;
+            });
+            (written, runs)
+        }
+        _ => (write_merged(address, None, merged), 1),
+    }
+}
+
 /// [`merge_race`]'s sums. Of frame `frame`, and in `total` since the
 /// start: stretches written back, their bytes, title bytes put back to
 /// older values, bytes the title and the card both changed, stretches with
@@ -5033,14 +5050,22 @@ impl Shadow {
             return 0;
         }
         crate::host::shaders_write(start + at, &title[..]);
+        clock.part(5);
+        clock.rest = 6;
         if self.put_back_own(start + at, &title[..], as_read.as_deref()) {
             #[cfg(feature = "diagnostics")]
             crate::backreads::stored(self.id, (self.start, self.len), start + at, n, true);
             return n;
         }
+        clock.part(6);
+        clock.rest = 7;
         crate::watch::writing(start + at, n);
+        clock.part(7);
+        clock.rest = 8;
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
-        self.wrote_back(write_merged(start + at, as_read.as_deref(), &title[..]));
+        let (written, runs) = write_merged_counted(start + at, as_read.as_deref(), &title[..]);
+        MERGE_RUNS.fetch_add(runs, Ordering::Relaxed);
+        self.wrote_back(written);
         #[cfg(feature = "diagnostics")]
         crate::backreads::stored(self.id, (self.start, self.len), start + at, n, false);
         n
@@ -5051,29 +5076,39 @@ impl Shadow {
 /// ([`Shadow::card_merge_relay`]) by part: waiting for the copy's merge
 /// lock (the submitting thread's merge under flights holds it), finding
 /// what the card changed, gathering the bytes the title sent since, reading
-/// title memory, merging, and writing back (the rest, to the end). Run 13
-/// had 70-74 ms a frame in these merges (48 in run 12) and nothing split
-/// them.
-pub(crate) static MERGE_PARTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// title memory, merging, telling the fills read ahead
+/// (`crate::host::shaders_write`), the store through a view of our own
+/// (or the try), opening the write-watch guards for the old way, and the
+/// old way's write (to the end). Run 13 had 70-74 ms a frame in these
+/// merges (48 in run 12) and nothing split them; run 14 had 139 ms of 180
+/// in "written back", which these last four parts split.
+pub(crate) static MERGE_PARTS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+
+/// Runs of words written the old way ([`write_merged_counted`]): one write
+/// each, since the last line.
+pub(crate) static MERGE_RUNS: AtomicU64 = AtomicU64::new(0);
 
 /// Times the parts of one merge into [`MERGE_PARTS`]; the time after the
-/// last part taken goes to the last part when dropped.
-struct MergeClock(std::time::Instant);
+/// last part taken goes to part `rest` when dropped.
+struct MergeClock {
+    at: std::time::Instant,
+    rest: usize,
+}
 
 impl MergeClock {
     fn new() -> Self {
-        MergeClock(std::time::Instant::now())
+        MergeClock { at: std::time::Instant::now(), rest: 5 }
     }
     fn part(&mut self, part: usize) {
         let now = std::time::Instant::now();
-        MERGE_PARTS[part].fetch_add((now - self.0).as_nanos() as u64, Ordering::Relaxed);
-        self.0 = now;
+        MERGE_PARTS[part].fetch_add((now - self.at).as_nanos() as u64, Ordering::Relaxed);
+        self.at = now;
     }
 }
 
 impl Drop for MergeClock {
     fn drop(&mut self) {
-        MERGE_PARTS[5].fetch_add(self.0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        MERGE_PARTS[self.rest].fetch_add(self.at.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 }
 

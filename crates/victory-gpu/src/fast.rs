@@ -46,10 +46,15 @@
 //!   frame);
 //! - `VICTORY_REFRESH_PAGES`: a refresh of watched title memory takes the
 //!   whole 64 KiB pages it touches (run 12 on the owner's PC: frames of
-//!   over 300 draws 195 -> 171 ms median, copies 104 -> 89 MB a frame).
+//!   over 300 draws 195 -> 171 ms median, copies 104 -> 89 MB a frame);
+//! - `VICTORY_WRITE_PLAIN`: what shaders wrote is stored into title memory
+//!   in place, the kernel's write behind it for a page that is not there
+//!   (run 14: 139 ms a frame of the card copies' merges went to writing
+//!   back, most stretches one `NtWriteVirtualMemory` per run of words;
+//!   untried on the owner's PC before run 15, which has it `alt`).
 //!
-//! `SETTLE_ROOM`, `LOOKUP_CACHE`, `PARALLEL_REFRESH` and `CARD_SYNC_BATCH`
-//! also take `alt` (twenty seconds each way, in turn).
+//! `SETTLE_ROOM`, `LOOKUP_CACHE`, `PARALLEL_REFRESH`, `CARD_SYNC_BATCH` and
+//! `WRITE_PLAIN` also take `alt` (twenty seconds each way, in turn).
 //!
 //! Each still takes its own `=0` (or `=1`); `VICTORY_FAST=0` puts every
 //! one of them back to off, as in runs 1-9, in one go.
@@ -57,7 +62,7 @@
 use std::sync::OnceLock;
 
 /// The switches [`on`] gives a default to, for the start-up line.
-const SWITCHES: [&str; 14] = [
+const SWITCHES: [&str; 15] = [
     "VICTORY_ASYNC_SUBMIT",
     "VICTORY_QUEUE2",
     "VICTORY_COPY_PLAIN",
@@ -72,6 +77,7 @@ const SWITCHES: [&str; 14] = [
     "VICTORY_PARALLEL_REFRESH",
     "VICTORY_CARD_SYNC_BATCH",
     "VICTORY_REFRESH_PAGES",
+    "VICTORY_WRITE_PLAIN",
 ];
 
 /// Whether the faster defaults hold (`VICTORY_FAST`, unset or anything but

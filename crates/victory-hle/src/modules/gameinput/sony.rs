@@ -103,6 +103,28 @@ fn state(lx: u8, ly: u8, rx: u8, ry: u8, triggers: [u8; 2], b: [u8; 3]) -> PadSt
     }
 }
 
+/// The vendor and product numbers a HID device's path names, for a device
+/// that cannot be opened to ask (HidHide, or another program holding it
+/// alone): USB paths hold `VID_054C&PID_0CE6`, Bluetooth ones
+/// `_VID&0002054C_PID&0CE6` (the `0002` names the Bluetooth numbering).
+pub(super) fn path_ids(path: &str) -> Option<(u16, u16)> {
+    let lower = path.to_ascii_lowercase();
+    let hex4 = |s: &str| s.get(..4).and_then(|h| u16::from_str_radix(h, 16).ok());
+    let vendor = if let Some(at) = lower.find("vid_") {
+        hex4(&lower[at + 4..])?
+    } else {
+        let at = lower.find("vid&")?;
+        // Four digits of numbering source, then the vendor.
+        hex4(lower.get(at + 8..)?)?
+    };
+    let product = if let Some(at) = lower.find("pid_") {
+        hex4(&lower[at + 4..])?
+    } else {
+        hex4(&lower[lower.find("pid&")? + 4..])?
+    };
+    Some((vendor, product))
+}
+
 /// Whether PlayStation pads are read (`VICTORY_SONY_PADS`, on unless `0`).
 pub(super) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -131,7 +153,7 @@ mod host {
         CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
     };
 
-    use super::{Kind, PadState, SONY, kind, parse};
+    use super::{Kind, PadState, SONY, kind, parse, path_ids};
 
     /// How often new pads are looked for.
     const RESCAN: Duration = Duration::from_secs(2);
@@ -178,15 +200,40 @@ mod host {
         static SEEN: Mutex<Option<String>> = Mutex::new(None);
         let paths = hid_paths();
         let mut sonys = Vec::new();
+        // Every device as vendor:product, for the line: run 14 found 20
+        // and no Sony one, and could not say what the 20 were.
+        let mut all = Vec::new();
         for path in paths.iter().cloned() {
+            let shown = String::from_utf16_lossy(&path[..path.len().saturating_sub(1)]);
             let known = PADS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|p| p.path == path);
             if known {
                 sonys.push("read already".to_owned());
+                all.push(path_ids(&shown).map_or_else(|| "?".to_owned(), |(v, p)| format!("{v:04x}:{p:04x}")));
                 continue;
             }
-            let Some((vendor, product)) = ids(&path) else {
-                continue;
+            let (vendor, product) = match ids(&path) {
+                Ok(ids) => ids,
+                Err(error) => {
+                    // Not to be opened even without access: HidHide hides
+                    // it from us, or it is going away. The path still says
+                    // what it is.
+                    let Some((vendor, product)) = path_ids(&shown) else {
+                        all.push(format!("? (not opened: {error})"));
+                        continue;
+                    };
+                    all.push(format!("{vendor:04x}:{product:04x} (not opened: {error})"));
+                    if vendor == SONY {
+                        let what = kind(product).map_or_else(|| "a Sony device".to_owned(), |k| format!("{k:?}"));
+                        sonys.push(format!(
+                            "{what} {product:#06x} HIDDEN FROM US ({error}: HidHide, from DS4Windows, hides it from every \
+                             program not on its list; add victory.exe in the HidHide Configuration Client, or run DS4Windows, \
+                             whose Xbox pad works here)"
+                        ));
+                    }
+                    continue;
+                }
             };
+            all.push(format!("{vendor:04x}:{product:04x}"));
             if vendor != SONY {
                 continue;
             }
@@ -194,10 +241,11 @@ mod host {
                 sonys.push(format!("product {product:#06x} (not a pad we read)"));
                 continue;
             };
-            sonys.push(format!("{kind:?} {product:#06x}"));
             let Some((handle, length)) = open(&path) else {
+                sonys.push(format!("{kind:?} {product:#06x} (could not be opened for reading: see the warning)"));
                 continue;
             };
+            sonys.push(format!("{kind:?} {product:#06x}"));
             let state = Arc::new(Mutex::new(None));
             let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
             let (s, a) = (state.clone(), alive.clone());
@@ -215,11 +263,16 @@ mod host {
             );
             PADS.lock().unwrap_or_else(|e| e.into_inner()).push(Pad { path, state, alive });
         }
-        let seen = format!("{} HID devices, Sony ones: [{}]", paths.len(), sonys.join(", "));
+        let seen = format!(
+            "{} HID devices, Sony ones: [{}]; all of them (vendor:product, Sony is 054c): {}",
+            paths.len(),
+            sonys.join(", "),
+            all.join(", ")
+        );
         let mut last = SEEN.lock().unwrap_or_else(|e| e.into_inner());
         if last.as_deref() != Some(seen.as_str()) {
             tracing::info!(
-                "PlayStation pads: the scan found {seen} (none: the pad is off, held hidden by HidHide or DS4Windows, or not a HID device here)"
+                "PlayStation pads: the scan found {seen} (no Sony one: the pad is off or not plugged in, or not a HID device here)"
             );
             *last = Some(seen);
         }
@@ -325,8 +378,9 @@ mod host {
         paths
     }
 
-    /// The vendor and product numbers of the HID device at `path`.
-    fn ids(path: &[u16]) -> Option<(u16, u16)> {
+    /// The vendor and product numbers of the HID device at `path`; the
+    /// error if it cannot be opened even without access.
+    fn ids(path: &[u16]) -> Result<(u16, u16), std::io::Error> {
         // No access asked: enough for the attributes, and it opens devices
         // others hold (keyboards, mice).
         // SAFETY: a NUL-terminated path.
@@ -342,7 +396,7 @@ mod host {
             )
         };
         if handle == INVALID_HANDLE_VALUE {
-            return None;
+            return Err(std::io::Error::last_os_error());
         }
         let mut attributes = HIDD_ATTRIBUTES {
             Size: size_of::<HIDD_ATTRIBUTES>() as u32,
@@ -354,7 +408,11 @@ mod host {
         let ok = unsafe { HidD_GetAttributes(handle, &mut attributes) };
         // SAFETY: ours.
         unsafe { CloseHandle(handle) };
-        ok.then_some((attributes.VendorID, attributes.ProductID))
+        if ok {
+            Ok((attributes.VendorID, attributes.ProductID))
+        } else {
+            Err(std::io::Error::other("the attributes were not given"))
+        }
     }
 
     /// The pad opened for reading, and the length of its input reports.
@@ -446,6 +504,20 @@ mod tests {
         assert_eq!(pad.left_trigger, 1.0);
         let r = report(78, 0x11, 3, &[128, 128, 128, 128, 0x06, 0x80, 0, 0, 0]);
         assert_eq!(parse(Kind::DualShock4, &r).unwrap().buttons, LEFT | RIGHT_STICK);
+    }
+
+    #[test]
+    fn a_device_path_names_its_vendor_and_product() {
+        assert_eq!(
+            path_ids(r"\\?\hid#vid_054c&pid_0ce6&mi_03#8&2b1a3c&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}"),
+            Some((0x054C, 0x0CE6))
+        );
+        assert_eq!(
+            path_ids(r"\\?\HID#{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0DF2#9&1f0e&0&0000#{4d1e55b2}"),
+            Some((0x054C, 0x0DF2))
+        );
+        assert_eq!(path_ids(r"\\?\hid#vid_046d&pid_c52b&mi_02&col01#a"), Some((0x046D, 0xC52B)));
+        assert_eq!(path_ids(r"\\?\hid#acpi0c50#1"), None);
     }
 
     #[test]
