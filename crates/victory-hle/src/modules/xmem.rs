@@ -649,39 +649,76 @@ impl Slice {
     }
 }
 
+/// The mapped views, under the lock the title's mapping calls hold over
+/// their host calls (map, commit, unmap). The page numbers ([`PAGES`]) and
+/// where each page shows ([`SHOWN`]) have locks of their own, held only for
+/// lookups and updates: run 18's DirectStorage workers, which need only
+/// those, waited for this one ~36 s of every 5 s (all threads) while the
+/// title remapped. Order: this lock, then either of the others; never the
+/// other way round.
 #[derive(Default)]
 struct Physical {
-    next_page: usize,
-    pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
-    /// Where each page shows: by its section and its index there, the
-    /// address of that page in every view that shows it now ([`shown_at`];
-    /// as upstream's c75fdba keeps it). The title maps pages where the
-    /// card reads them and has them filled afterwards by DirectStorage,
-    /// which writes through views of our own.
-    shown: HashMap<(usize, usize), Vec<usize>>,
 }
 
-static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
-    Mutex::new(Physical {
+static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(Default::default);
+
+/// Page numbers and the slices they name (`XMemAllocatePhysicalPages`).
+struct Pages {
+    next_page: usize,
+    map: HashMap<usize, Slice>,
+}
+
+static PAGES: LazyLock<std::sync::RwLock<Pages>> = LazyLock::new(|| {
+    std::sync::RwLock::new(Pages {
         // Page numbers are opaque to titles; 0 stays unused.
         next_page: 0x10_0000,
-        ..Default::default()
+        map: HashMap::new(),
     })
 });
 
-fn physical() -> MutexGuard<'static, Physical> {
-    match PHYSICAL.try_lock() {
-        Ok(physical) => physical,
+/// Where each page shows: by its section and its index there, the address
+/// of that page in every view that shows it now ([`shown_at`]; as
+/// upstream's c75fdba keeps it). The title maps pages where the card reads
+/// them and has them filled afterwards by DirectStorage, which writes
+/// through views of our own. Changed with the views, under [`PHYSICAL`]
+/// too; a lookup between the two halves of a remap finds the page unshown
+/// at the old address and not yet at the new one, and the remap itself
+/// tells the GPU side of the new one (`title_memory_remapped`).
+static SHOWN: LazyLock<Mutex<HashMap<(usize, usize), Vec<usize>>>> = LazyLock::new(Default::default);
+
+/// Takes a lock, adding any wait to [`VIEWS`]' count.
+fn timed<G>(
+    try_take: impl FnOnce() -> Result<G, std::sync::TryLockError<G>>,
+    take: impl FnOnce() -> Result<G, std::sync::PoisonError<G>>,
+) -> G {
+    match try_take() {
+        Ok(guard) => guard,
         Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => {
             let started = std::time::Instant::now();
-            let physical = PHYSICAL.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = take().unwrap_or_else(|e| e.into_inner());
             VIEWS[4].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-            physical
+            guard
         }
     }
+}
+
+fn physical() -> MutexGuard<'static, Physical> {
+    timed(|| PHYSICAL.try_lock(), || PHYSICAL.lock())
+}
+
+fn pages_read() -> std::sync::RwLockReadGuard<'static, Pages> {
+    timed(|| PAGES.try_read(), || PAGES.read())
+}
+
+fn pages_write() -> std::sync::RwLockWriteGuard<'static, Pages> {
+    timed(|| PAGES.try_write(), || PAGES.write())
+}
+
+fn shown() -> MutexGuard<'static, HashMap<(usize, usize), Vec<usize>>> {
+    timed(|| SHOWN.try_lock(), || SHOWN.lock())
 }
 
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
@@ -732,16 +769,16 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
     let section = Arc::new(Section::new(handle, n));
-    let mut physical = physical();
-    let first = physical.next_page;
-    physical.next_page += n * FRAMES;
+    let mut table = pages_write();
+    let first = table.next_page;
+    table.next_page += n * FRAMES;
     for index in 0..n {
         let slice = Slice {
             section: section.clone(),
             index,
         };
         let number = first + index * FRAMES;
-        physical.pages.insert(number, slice);
+        table.map.insert(number, slice);
         // SAFETY: the title passes room for `n` page numbers.
         unsafe { pages.add(index).write(number) };
     }
@@ -758,10 +795,10 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     if pages.is_null() {
         return 0;
     }
-    let mut physical = physical();
+    let mut table = pages_write();
     for i in 0..n {
         // SAFETY: the title passes `n` page numbers.
-        physical.pages.remove(&unsafe { *pages.add(i) });
+        table.map.remove(&unsafe { *pages.add(i) });
     }
     1
 }
@@ -831,10 +868,10 @@ impl Drop for View {
 fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)>> {
     let end = offset.checked_add(len)?;
     let pages = pages.get(offset / PAGE..end.div_ceil(PAGE))?;
-    let physical = physical();
+    let table = pages_read();
     let mut runs: Vec<(Slice, usize)> = Vec::new();
     for page in pages {
-        let slice = physical.pages.get(page)?;
+        let slice = table.map.get(page)?;
         match runs.last_mut() {
             Some((first, n))
                 if Arc::ptr_eq(&first.section, &slice.section)
@@ -968,9 +1005,14 @@ pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize
     };
     let mut pieces: Vec<(usize, usize)> = Vec::new();
     {
-        let physical = physical();
-        for (i, page) in touched.iter().enumerate() {
-            let Some(addresses) = physical.pages.get(page).and_then(|slice| physical.shown.get(&slice.key(0))) else {
+        // The keys first, then where they show: one lock at a time.
+        let keys: Vec<Option<(usize, usize)>> = {
+            let table = pages_read();
+            touched.iter().map(|page| table.map.get(page).map(|slice| slice.key(0))).collect()
+        };
+        let shown = shown();
+        for (i, key) in keys.iter().enumerate() {
+            let Some(addresses) = key.and_then(|key| shown.get(&key)) else {
                 continue;
             };
             // The bytes of this page that the write covers.
@@ -1045,18 +1087,22 @@ fn map_pages(address: *mut c_void, n: usize, pages: *const usize) -> *mut c_void
     }
     // SAFETY: the title passes `n` page numbers.
     let pages = unsafe { std::slice::from_raw_parts(pages, n) };
+    let slices: Vec<Option<Slice>> = {
+        let table = pages_read();
+        pages.iter().map(|page| table.map.get(page).cloned()).collect()
+    };
     let mut i = 0;
     while i < n {
-        let Some(first) = physical.pages.get(&pages[i]).cloned() else {
+        let Some(first) = slices[i].clone() else {
             tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
             return std::ptr::null_mut();
         };
         // One view per run of consecutive slices of one section.
-        let run = 1 + pages[i + 1..]
+        let run = 1 + slices[i + 1..]
             .iter()
             .zip(1..)
-            .take_while(|&(page, k)| {
-                physical.pages.get(page).is_some_and(|s| {
+            .take_while(|&(slice, k)| {
+                slice.as_ref().is_some_and(|s| {
                     Arc::ptr_eq(&s.section, &first.section) && s.index == first.index + k
                 })
             })
@@ -1245,8 +1291,11 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // What the range shows now, for the GPU side's in-place census.
     victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64);
     add(T::RemapNotesUs, committed.elapsed().as_micros() as u64);
-    for k in 0..len.div_ceil(PAGE) {
-        physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
+    {
+        let mut shown = shown();
+        for k in 0..len.div_ceil(PAGE) {
+            shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
+        }
     }
     physical.views.insert(base, (len, slice));
     true
@@ -1326,12 +1375,15 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
-        for k in 0..size.div_ceil(PAGE) {
-            let key = slice.key(k);
-            if let Some(addresses) = physical.shown.get_mut(&key) {
-                addresses.retain(|&a| a != at + k * PAGE);
-                if addresses.is_empty() {
-                    physical.shown.remove(&key);
+        {
+            let mut shown = shown();
+            for k in 0..size.div_ceil(PAGE) {
+                let key = slice.key(k);
+                if let Some(addresses) = shown.get_mut(&key) {
+                    addresses.retain(|&a| a != at + k * PAGE);
+                    if addresses.is_empty() {
+                        shown.remove(&key);
+                    }
                 }
             }
         }
@@ -1834,7 +1886,7 @@ mod tests {
 
     /// The bytes of one page, through a view of our own.
     fn page_bytes(page: usize) -> Vec<u8> {
-        let slice = physical().pages.get(&page).cloned().expect("known page");
+        let slice = pages_read().map.get(&page).cloned().expect("known page");
         View::map(&slice, 1).expect("mapped").bytes().to_vec()
     }
 
@@ -1940,7 +1992,7 @@ mod tests {
     #[test]
     fn writes_share_a_kept_view_that_goes_with_its_allocation() {
         let pages = allocate(3);
-        let section = Arc::downgrade(&physical().pages[&pages[0]].section);
+        let section = Arc::downgrade(&pages_read().map[&pages[0]].section);
         let kept_at = || {
             let section = section.upgrade().expect("alive");
             section.kept.get().and_then(Option::as_ref).map(|k| k.at.Value as usize)
