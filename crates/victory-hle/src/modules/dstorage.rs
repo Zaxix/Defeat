@@ -692,6 +692,21 @@ impl Lanes {
                     split(&sums, n)
                 );
             }
+            // Where the parts around the write go (run 17): views made and
+            // unmapped per write against writes through kept views, and
+            // the page table's lock that the title's mappings share.
+            let [made, made_us, unmapped_us, kept, waited_us] = super::xmem::take_view_stats();
+            if made + kept + waited_us > 0 {
+                tracing::info!(
+                    "dstorage, views of physical pages in the last {:.1} s: {made} made for one write ({:.0} ms mapping and \
+                     committing, {:.0} ms unmapping), {kept} writes through kept views; the page table's lock waited for \
+                     {:.0} ms (all threads)",
+                    elapsed.as_secs_f64(),
+                    made_us as f64 / 1e3,
+                    unmapped_us as f64 / 1e3,
+                    waited_us as f64 / 1e3,
+                );
+            }
             self.done = Default::default();
             self.bcpack = Default::default();
             self.since = None;

@@ -10,7 +10,7 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use windows_sys::Win32::Foundation::{
@@ -511,18 +511,127 @@ fn split_late() -> bool {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+struct Section {
+    handle: HANDLE,
+    /// Its size in pages.
+    pages: usize,
+    /// A view of all of it kept for DirectStorage's writes ([`Kept`]),
+    /// made at the first; `None` if mapping it failed.
+    kept: std::sync::OnceLock<Option<Kept>>,
+}
 
-// SAFETY: a section handle may be used from any thread.
+// SAFETY: a section handle may be used from any thread, and the kept
+// view's address is plain data.
 unsafe impl Send for Section {}
 // SAFETY: as above.
 unsafe impl Sync for Section {}
 
+impl Section {
+    fn new(handle: HANDLE, pages: usize) -> Section {
+        Section {
+            handle,
+            pages,
+            kept: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The view of all of the section kept for writes, mapped (not
+    /// committed) the first time.
+    fn kept(&self) -> Option<&Kept> {
+        self.kept
+            .get_or_init(|| {
+                use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+                let len = self.pages * PAGE;
+                let started = std::time::Instant::now();
+                // SAFETY: a view of our own section, unmapped when it drops.
+                let at = unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, len) };
+                VIEWS[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                if at.Value.is_null() {
+                    let error = std::io::Error::last_os_error();
+                    tracing::warn!(len, %error, "a kept view of physical pages could not be mapped; views are made per write");
+                    return None;
+                }
+                let words = self.pages.div_ceil(64);
+                Some(Kept {
+                    at,
+                    committed: (0..words).map(|_| AtomicU64::new(0)).collect(),
+                })
+            })
+            .as_ref()
+    }
+}
+
 impl Drop for Section {
     fn drop(&mut self) {
+        if let Some(Some(kept)) = self.kept.get() {
+            use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+            // SAFETY: our view, and nothing writes through it any more:
+            // a write holds the section (`Bytes::Kept`).
+            unsafe { UnmapViewOfFile(kept.at) };
+        }
         // SAFETY: our handle; views keep the section alive on their own.
-        unsafe { CloseHandle(self.0) };
+        unsafe { CloseHandle(self.handle) };
     }
+}
+
+/// A view of a whole section that DirectStorage writes through, kept for
+/// the section's life (`VICTORY_DSTORAGE_KEEP_VIEWS`, on by default; `=0`:
+/// a view mapped, committed and unmapped for every write, as before run
+/// 18). Run 17's slow requests spent 200-550 ms in the parts around the
+/// write that mapped and unmapped those views, while the reads and the
+/// decodes took 1-14 ms: each map and unmap takes the process's address
+/// space lock, which the guards' protection changes, the title's own
+/// mappings and 16 workers share.
+struct Kept {
+    at: MEMORY_MAPPED_VIEW_ADDRESS,
+    /// A bit per page committed through it already.
+    committed: Box<[AtomicU64]>,
+}
+
+impl Kept {
+    /// Commits pages `[index, index + n)` unless all of them were.
+    fn commit(&self, index: usize, n: usize) -> bool {
+        let bit = |i: usize| (&self.committed[i / 64], 1u64 << (i % 64));
+        let all = (index..index + n).all(|i| {
+            let (word, mask) = bit(i);
+            word.load(Ordering::Relaxed) & mask != 0
+        });
+        if all {
+            return true;
+        }
+        if !commit(self.at.Value as usize + index * PAGE, n * PAGE) {
+            return false;
+        }
+        for i in index..index + n {
+            let (word, mask) = bit(i);
+            word.fetch_or(mask, Ordering::Relaxed);
+        }
+        true
+    }
+}
+
+/// Whether DirectStorage writes through kept views ([`Kept`]).
+fn keep_views() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        let on = !matches!(
+            std::env::var("VICTORY_DSTORAGE_KEEP_VIEWS").as_deref().map(str::trim),
+            Ok("0")
+        );
+        tracing::info!(on, "dstorage: writes through kept views of physical pages (VICTORY_DSTORAGE_KEEP_VIEWS)");
+        on
+    });
+    *ON
+}
+
+/// Since the last [`take_view_stats`]: views mapped for one write, the
+/// microseconds mapping and committing them (and kept views mapped),
+/// microseconds unmapping them, writes through kept views, and
+/// microseconds any thread waited for the page table's lock.
+static VIEWS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Takes [`VIEWS`] for DirectStorage's 5 s line.
+pub(crate) fn take_view_stats() -> [u64; 5] {
+    std::array::from_fn(|i| VIEWS[i].swap(0, Ordering::Relaxed))
 }
 
 /// Where a page lives, or what a view starts with: a section and a page
@@ -563,7 +672,16 @@ static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
 });
 
 fn physical() -> MutexGuard<'static, Physical> {
-    PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
+    match PHYSICAL.try_lock() {
+        Ok(physical) => physical,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let started = std::time::Instant::now();
+            let physical = PHYSICAL.lock().unwrap_or_else(|e| e.into_inner());
+            VIEWS[4].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            physical
+        }
+    }
 }
 
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
@@ -613,7 +731,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
+    let section = Arc::new(Section::new(handle, n));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -666,7 +784,7 @@ impl View {
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let at = unsafe {
             MapViewOfFile(
-                slice.section.0,
+                slice.section.handle,
                 FILE_MAP_WRITE,
                 (offset >> 32) as u32,
                 offset as u32,
@@ -678,6 +796,8 @@ impl View {
         }
         let view = View { at, len };
         let committed = commit(at.Value as usize, len);
+        VIEWS[0].fetch_add(1, Ordering::Relaxed);
+        VIEWS[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         victory_gpu::framelog::add(victory_gpu::framelog::T::DiskViews, 1);
         victory_gpu::framelog::add(victory_gpu::framelog::T::DiskViewUs, started.elapsed().as_micros() as u64);
         committed.then_some(view)
@@ -697,7 +817,9 @@ impl Drop for View {
         let started = std::time::Instant::now();
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(self.at) };
-        victory_gpu::framelog::add(victory_gpu::framelog::T::DiskViewUs, started.elapsed().as_micros() as u64);
+        let us = started.elapsed().as_micros() as u64;
+        victory_gpu::framelog::add(victory_gpu::framelog::T::DiskViewUs, us);
+        VIEWS[2].fetch_add(us, Ordering::Relaxed);
     }
 }
 
@@ -743,7 +865,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     };
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
-        let Some(mut view) = View::map(slice, *n) else {
+        let Some(mut view) = window(slice, *n) else {
             return false;
         };
         let k = (n * PAGE - within).min(data.len() - done);
@@ -757,7 +879,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
 /// until dropped: DirectStorage decodes into it instead of a buffer it
 /// would then copy.
 pub(crate) struct PageWindow {
-    view: View,
+    view: Bytes,
     within: usize,
     len: usize,
 }
@@ -780,10 +902,52 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         return None;
     };
     Some(PageWindow {
-        view: View::map(slice, *n)?,
+        view: window(slice, *n)?,
         within: offset % PAGE,
         len,
     })
+}
+
+/// Writable bytes of `n` pages from `slice` on: in the section's kept view
+/// when there is one ([`Kept`]), else a view of their own.
+enum Bytes {
+    Own(View),
+    Kept {
+        at: usize,
+        len: usize,
+        /// Keeps the kept view mapped while the bytes are written.
+        _section: Arc<Section>,
+    },
+}
+
+impl Bytes {
+    fn bytes(&mut self) -> &mut [u8] {
+        match self {
+            Bytes::Own(view) => view.bytes(),
+            // SAFETY: `len` committed bytes of the kept view, mapped while
+            // `_section` lives; the request writing them is their only
+            // writer until it completes, as with a view of their own.
+            Bytes::Kept { at, len, .. } => unsafe {
+                std::slice::from_raw_parts_mut(*at as *mut u8, *len)
+            },
+        }
+    }
+}
+
+fn window(slice: &Slice, n: usize) -> Option<Bytes> {
+    if keep_views()
+        && slice.index + n <= slice.section.pages
+        && let Some(kept) = slice.section.kept()
+        && kept.commit(slice.index, n)
+    {
+        VIEWS[3].fetch_add(1, Ordering::Relaxed);
+        return Some(Bytes::Kept {
+            at: kept.at.Value as usize + slice.index * PAGE,
+            len: n * PAGE,
+            _section: slice.section.clone(),
+        });
+    }
+    View::map(slice, n).map(Bytes::Own)
 }
 
 /// The title addresses that show bytes `[offset, offset + len)` of `pages`
@@ -1028,7 +1192,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         // SAFETY: acts only on a placeholder.
         let view = unsafe {
             MapViewOfFile3(
-                slice.section.0,
+                slice.section.handle,
                 GetCurrentProcess(),
                 base as *const c_void,
                 (slice.index * PAGE) as u64,
@@ -1079,7 +1243,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
-    victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64);
     add(T::RemapNotesUs, committed.elapsed().as_micros() as u64);
     for k in 0..len.div_ceil(PAGE) {
         physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
@@ -1768,6 +1932,31 @@ mod tests {
         }
         assert!(shown_at(&pages, 0, 3 * PAGE).is_empty());
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    /// Writes into one allocation go through one view of it, kept until
+    /// the allocation is gone (`VICTORY_DSTORAGE_KEEP_VIEWS` is on by
+    /// default), and land where a view of their own would show them.
+    #[test]
+    fn writes_share_a_kept_view_that_goes_with_its_allocation() {
+        let pages = allocate(3);
+        let section = Arc::downgrade(&physical().pages[&pages[0]].section);
+        let kept_at = || {
+            let section = section.upgrade().expect("alive");
+            section.kept.get().and_then(Option::as_ref).map(|k| k.at.Value as usize)
+        };
+        assert_eq!(kept_at(), None, "made at the first write");
+        assert!(write_physical(&pages[1..], 5, &[1, 2, 3]));
+        let first = kept_at().expect("kept");
+        let mut window = page_window(&pages, 2 * PAGE - 1, 2).expect("one run");
+        window.bytes().copy_from_slice(&[7, 8]);
+        drop(window);
+        assert_eq!(kept_at(), Some(first), "the same view");
+        assert_eq!(page_bytes(pages[1])[..9], [0, 0, 0, 0, 0, 1, 2, 3, 0]);
+        assert_eq!(page_bytes(pages[1])[PAGE - 1], 7);
+        assert_eq!(page_bytes(pages[2])[0], 8);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+        assert!(section.upgrade().is_none(), "unmapped with its section");
     }
 
     #[test]

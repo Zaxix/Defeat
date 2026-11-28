@@ -79,6 +79,10 @@ struct Run {
     storage_parts: Vec<(f64, [f64; 6])>,
     /// `VICTORY_READBACK_REUSE=1`: (all, again untouched, touched, first) MB a frame.
     reuse: Vec<[f64; 4]>,
+    /// DirectStorage's views of physical pages, per 5 s line: (seconds,
+    /// views made for one write, ms mapping and committing, ms unmapping,
+    /// writes through kept views, ms the page table's lock waited).
+    views: Vec<[f64; 6]>,
 }
 
 /// The parts of the storage split, as its line names them.
@@ -197,6 +201,14 @@ fn parse(text: &str) -> Run {
             if let Some(running) = after(&line, "a list of ours running ") {
                 meter.push((at, running, 0.0));
             }
+        } else if line.contains("dstorage, views of physical pages in the last ") {
+            let secs = after(&line, "in the last ").unwrap_or(0.0);
+            let made = after(&line, " s: ").unwrap_or(0.0);
+            let mapping = after(&line, "made for one write (").unwrap_or(0.0);
+            let unmapping = after(&line, "committing, ").unwrap_or(0.0);
+            let kept = after(&line, "ms unmapping), ").unwrap_or(0.0);
+            let waited = after(&line, "the page table's lock waited for ").unwrap_or(0.0);
+            run.views.push([secs, made, mapping, unmapping, kept, waited]);
         } else if line.contains("dstorage, where the time went") {
             if let Some(i) = line.find("requests of 250 ms or more, on average: ") {
                 let tail = &line[i..];
@@ -420,6 +432,18 @@ fn report(path: &Path, run: &Run, guard_s: f64) -> String {
             .collect();
         out.push_str(&format!("  storage requests of 250 ms or more ({n:.0}), on average, ms: {}\n", avg.join(", ")));
     }
+    if !run.views.is_empty() {
+        let sum = |k: usize| run.views.iter().map(|v| v[k]).sum::<f64>();
+        let minutes = (sum(0) / 60.0).max(1e-9);
+        out.push_str(&format!(
+            "  storage views of physical pages, a minute: {:.0} made for one write ({:.0} ms mapping and committing, {:.0} ms unmapping), {:.0} writes through kept views; the page table's lock waited {:.0} ms\n",
+            sum(1) / minutes,
+            sum(2) / minutes,
+            sum(3) / minutes,
+            sum(4) / minutes,
+            sum(5) / minutes,
+        ));
+    }
     if !run.reuse.is_empty() {
         let col = |k: usize| {
             let mut v: Vec<f64> = run.reuse.iter().map(|r| r[k]).collect();
@@ -498,6 +522,13 @@ switches       VICTORY_BVH_BUILDER=0 VICTORY_WRITE_PLAIN=alt\n\
         assert_eq!(run.frames[0].card_running, Some(61.5));
         assert_eq!(run.storage_parts, [(10.0, [2000.0, 1.0, 300.0, 2.0, 200.0, 0.0])]);
         assert_eq!(run.reuse, [[30.0, 12.0, 15.0, 3.0]]);
+    }
+
+    #[test]
+    fn the_storage_views_line_is_read() {
+        let log = "2026-11-28T03:10:00.000000Z  INFO victory_hle::modules::dstorage: dstorage, views of physical pages in the last 5.0 s: 120 made for one write (310 ms mapping and committing, 450 ms unmapping), 3000 writes through kept views; the page table's lock waited for 25 ms (all threads)\n";
+        let run = parse(log);
+        assert_eq!(run.views, [[5.0, 120.0, 310.0, 450.0, 3000.0, 25.0]]);
     }
 
     #[test]
