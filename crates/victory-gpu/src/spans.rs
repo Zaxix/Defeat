@@ -15,8 +15,8 @@ pub(crate) struct Spans {
 }
 
 impl Spans {
-    pub(crate) fn new() -> Spans {
-        Spans::default()
+    pub(crate) const fn new() -> Spans {
+        Spans { runs: BTreeMap::new() }
     }
 
     /// The run holding `n`, if any.
