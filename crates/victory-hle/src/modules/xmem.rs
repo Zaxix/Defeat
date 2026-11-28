@@ -1863,7 +1863,7 @@ mod tests {
         for &x in &c {
             assert_eq!((x >> 4 & 0x1f_ffff) << 4, x, "survives the title's packing");
         }
-        assert!(PAGE_LIMIT - FRAMES <= 0x1f_ffff << 4);
+        const { assert!(PAGE_LIMIT - FRAMES <= 0x1f_ffff << 4) };
     }
 
     #[test]
