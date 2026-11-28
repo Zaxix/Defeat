@@ -625,12 +625,13 @@ fn keep_views() -> bool {
 
 /// Since the last [`take_view_stats`]: views mapped for one write, the
 /// microseconds mapping and committing them (and kept views mapped),
-/// microseconds unmapping them, writes through kept views, and
-/// microseconds any thread waited for the page table's lock.
-static VIEWS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// microseconds unmapping them, writes through kept views, microseconds
+/// any thread waited for the page table's lock, and writes that met
+/// another in flight on the same pages ([`Claim`]).
+static VIEWS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// Takes [`VIEWS`] for DirectStorage's 5 s line.
-pub(crate) fn take_view_stats() -> [u64; 5] {
+pub(crate) fn take_view_stats() -> [u64; 6] {
     std::array::from_fn(|i| VIEWS[i].swap(0, Ordering::Relaxed))
 }
 
@@ -668,15 +669,81 @@ static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(Default::default);
 struct Pages {
     next_page: usize,
     map: HashMap<usize, Slice>,
+    /// Numbers the title gave back, as runs: the first -> how many pages.
+    /// Given out again only once `next_page` reaches [`PAGE_LIMIT`].
+    free: BTreeMap<usize, usize>,
+    /// Pages numbered since the start, and how many of them took a number
+    /// given back.
+    given: u64,
+    reused: u64,
 }
 
-static PAGES: LazyLock<std::sync::RwLock<Pages>> = LazyLock::new(|| {
-    std::sync::RwLock::new(Pages {
-        // Page numbers are opaque to titles; 0 stays unused.
-        next_page: 0x10_0000,
-        map: HashMap::new(),
-    })
-});
+/// The first page number; 0 stays unused (numbers are opaque to titles).
+const FIRST_PAGE: usize = 0x10_0000;
+
+/// Numbers from here on do not survive the title's 21-bit `number >> 4`
+/// ([`FRAMES`]): numbering only ever went up, so after some 124 GiB of
+/// allocations in all (freed or not) the title's numbers would wrap onto
+/// live ones (R75, as VIctory-NVIDIA 108a897 bounds them).
+const PAGE_LIMIT: usize = 1 << 25;
+
+impl Pages {
+    fn new() -> Pages {
+        Pages {
+            next_page: FIRST_PAGE,
+            map: HashMap::new(),
+            free: BTreeMap::new(),
+            given: 0,
+            reused: 0,
+        }
+    }
+
+    /// Numbers for `n` pages: new ones while they stay under `limit`, then
+    /// the lowest given back. `None` if there are not `n` left.
+    fn take(&mut self, n: usize, limit: usize) -> Option<Vec<usize>> {
+        let fresh = n.checked_mul(FRAMES).and_then(|len| self.next_page.checked_add(len)).filter(|&end| end <= limit);
+        let numbers: Vec<usize> = if let Some(end) = fresh {
+            let first = self.next_page;
+            self.next_page = end;
+            (0..n).map(|i| first + i * FRAMES).collect()
+        } else {
+            if self.free.values().sum::<usize>() < n {
+                return None;
+            }
+            let mut numbers = Vec::with_capacity(n);
+            while numbers.len() < n {
+                let (&first, &count) = self.free.iter().next()?;
+                let used = count.min(n - numbers.len());
+                self.free.remove(&first);
+                numbers.extend((0..used).map(|i| first + i * FRAMES));
+                if used < count {
+                    self.free.insert(first + used * FRAMES, count - used);
+                }
+            }
+            self.reused += n as u64;
+            numbers
+        };
+        self.given += n as u64;
+        Some(numbers)
+    }
+
+    /// Takes `number` back for [`Pages::take`], joining its neighbours.
+    fn give_back(&mut self, number: usize) {
+        let (mut first, mut count) = (number, 1);
+        if let Some((&before, &before_count)) = self.free.range(..number).next_back()
+            && before + before_count * FRAMES == number
+        {
+            self.free.remove(&before);
+            (first, count) = (before, before_count + 1);
+        }
+        if let Some(after_count) = self.free.remove(&(number + FRAMES)) {
+            count += after_count;
+        }
+        self.free.insert(first, count);
+    }
+}
+
+static PAGES: LazyLock<std::sync::RwLock<Pages>> = LazyLock::new(|| std::sync::RwLock::new(Pages::new()));
 
 /// Where each page shows: by its section and its index there, the address
 /// of that page in every view that shows it now ([`shown_at`]; as
@@ -770,14 +837,30 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
     let section = Arc::new(Section::new(handle, n));
     let mut table = pages_write();
-    let first = table.next_page;
-    table.next_page += n * FRAMES;
-    for index in 0..n {
+    let reused_before = table.reused;
+    let Some(numbers) = table.take(n, PAGE_LIMIT) else {
+        tracing::error!(
+            n,
+            pages_so_far = table.given,
+            in_use = table.map.len(),
+            "XMemAllocatePhysicalPages: no page numbers left in the title's 21-bit range"
+        );
+        // SAFETY: checked non-null.
+        unsafe { count.write(0) };
+        return 0;
+    };
+    if reused_before == 0 && table.reused > 0 {
+        tracing::warn!(
+            pages_so_far = table.given,
+            in_use = table.map.len(),
+            "physical page numbers reached the title's 21-bit range; numbers the title gave back are given out again"
+        );
+    }
+    for (index, number) in numbers.into_iter().enumerate() {
         let slice = Slice {
             section: section.clone(),
             index,
         };
-        let number = first + index * FRAMES;
         table.map.insert(number, slice);
         // SAFETY: the title passes room for `n` page numbers.
         unsafe { pages.add(index).write(number) };
@@ -798,9 +881,21 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     let mut table = pages_write();
     for i in 0..n {
         // SAFETY: the title passes `n` page numbers.
-        table.map.remove(&unsafe { *pages.add(i) });
+        let number = unsafe { *pages.add(i) };
+        if table.map.remove(&number).is_some() {
+            table.give_back(number);
+        }
     }
     1
+}
+
+/// Physical pages numbered since the start, numbers given out again among
+/// them, numbers in use, and the highest number given out: for the
+/// DirectStorage 5 s line (R75: does a long session reach the title's
+/// 21-bit range?).
+pub(crate) fn page_number_stats() -> (u64, u64, usize, usize) {
+    let table = pages_read();
+    (table.given, table.reused, table.map.len(), table.next_page.saturating_sub(FRAMES))
 }
 
 /// A view of our own on consecutive slices of one section, committed and
@@ -952,9 +1047,43 @@ enum Bytes {
     Kept {
         at: usize,
         len: usize,
+        /// These bytes are this write's alone until it drops.
+        _claim: Claim,
         /// Keeps the kept view mapped while the bytes are written.
         _section: Arc<Section>,
     },
+}
+
+/// Bytes of a kept view that one write holds (R75): two requests filling
+/// the same pages at once would otherwise both hold `&mut` slices of the
+/// same bytes. The second takes a view of its own instead, as every write
+/// did before kept views (a separate mapping, as Rust sees it).
+struct Claim {
+    at: usize,
+    len: usize,
+}
+
+static IN_FLIGHT: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+impl Claim {
+    /// Claims `[at, at + len)` unless a write in flight holds any of it.
+    fn take(at: usize, len: usize) -> Option<Claim> {
+        let mut held = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        if held.iter().any(|&(a, l)| a < at + len && at < a + l) {
+            return None;
+        }
+        held.push((at, len));
+        Some(Claim { at, len })
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        let mut held = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = held.iter().position(|&h| h == (self.at, self.len)) {
+            held.swap_remove(i);
+        }
+    }
 }
 
 impl Bytes {
@@ -962,8 +1091,8 @@ impl Bytes {
         match self {
             Bytes::Own(view) => view.bytes(),
             // SAFETY: `len` committed bytes of the kept view, mapped while
-            // `_section` lives; the request writing them is their only
-            // writer until it completes, as with a view of their own.
+            // `_section` lives, and no other write's while `_claim` holds
+            // them.
             Bytes::Kept { at, len, .. } => unsafe {
                 std::slice::from_raw_parts_mut(*at as *mut u8, *len)
             },
@@ -977,12 +1106,17 @@ fn window(slice: &Slice, n: usize) -> Option<Bytes> {
         && let Some(kept) = slice.section.kept()
         && kept.commit(slice.index, n)
     {
-        VIEWS[3].fetch_add(1, Ordering::Relaxed);
-        return Some(Bytes::Kept {
-            at: kept.at.Value as usize + slice.index * PAGE,
-            len: n * PAGE,
-            _section: slice.section.clone(),
-        });
+        let (at, len) = (kept.at.Value as usize + slice.index * PAGE, n * PAGE);
+        if let Some(claim) = Claim::take(at, len) {
+            VIEWS[3].fetch_add(1, Ordering::Relaxed);
+            return Some(Bytes::Kept {
+                at,
+                len,
+                _claim: claim,
+                _section: slice.section.clone(),
+            });
+        }
+        VIEWS[5].fetch_add(1, Ordering::Relaxed);
     }
     View::map(slice, n).map(Bytes::Own)
 }
@@ -1704,6 +1838,34 @@ mod tests {
         assert!(!fallback.contains("System commit:"));
     }
 
+    /// Numbers go up until the limit, then come from those given back,
+    /// lowest first, across runs; never one still in use; `None` when
+    /// there are not enough.
+    #[test]
+    fn page_numbers_stay_in_the_titles_range_and_are_given_out_again() {
+        let limit = FIRST_PAGE + 8 * FRAMES;
+        let mut pages = Pages::new();
+        let a = pages.take(5, limit).expect("fresh");
+        assert_eq!(a, (0..5).map(|i| FIRST_PAGE + i * FRAMES).collect::<Vec<_>>());
+        let b = pages.take(3, limit).expect("fresh, up to the limit");
+        assert_eq!(b[2] + FRAMES, limit);
+        assert_eq!(pages.take(1, limit), None, "nothing given back yet");
+        for &number in [&a[1], &a[2], &a[4], &b[0]] {
+            pages.give_back(number);
+        }
+        // a[4] and b[0] are neighbours: one run of two; a[1], a[2] another.
+        assert_eq!(pages.free.len(), 2);
+        let c = pages.take(3, limit).expect("given back");
+        assert_eq!(c, [a[1], a[2], a[4]]);
+        assert_eq!(pages.take(2, limit), None, "only one left");
+        assert_eq!(pages.take(1, limit), Some(vec![b[0]]));
+        assert_eq!((pages.given, pages.reused), (12, 4));
+        for &x in &c {
+            assert_eq!((x >> 4 & 0x1f_ffff) << 4, x, "survives the title's packing");
+        }
+        assert!(PAGE_LIMIT - FRAMES <= 0x1f_ffff << 4);
+    }
+
     #[test]
     fn physical_pages_map_alias_and_unmap() {
         let mut pages = [0usize; 3];
@@ -2009,6 +2171,26 @@ mod tests {
         assert_eq!(page_bytes(pages[2])[0], 8);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert!(section.upgrade().is_none(), "unmapped with its section");
+    }
+
+    /// A write whose pages another write in flight holds gets a view of
+    /// its own; once that one is done, the kept view again.
+    #[test]
+    fn writes_on_the_same_pages_at_once_do_not_share_the_kept_view() {
+        let pages = allocate(2);
+        let kept = |w: &PageWindow| matches!(w.view, Bytes::Kept { .. });
+        let mut first = page_window(&pages, 0, PAGE + 8).expect("one run");
+        assert!(kept(&first));
+        let mut second = page_window(&pages, PAGE, 16).expect("one run");
+        assert!(!kept(&second), "the second page is the first write's");
+        let elsewhere = page_window(&pages[1..], 0, 8).expect("one run");
+        assert!(!kept(&elsewhere));
+        first.bytes()[PAGE..PAGE + 2].copy_from_slice(&[1, 2]);
+        second.bytes()[2..4].copy_from_slice(&[3, 4]);
+        drop((first, second, elsewhere));
+        assert!(kept(&page_window(&pages, PAGE, 16).expect("one run")));
+        assert_eq!(page_bytes(pages[1])[..4], [1, 2, 3, 4]);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 
     #[test]

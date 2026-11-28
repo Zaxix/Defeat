@@ -695,16 +695,20 @@ impl Lanes {
             // Where the parts around the write go (run 17): views made and
             // unmapped per write against writes through kept views, and
             // the page table's lock that the title's mappings share.
-            let [made, made_us, unmapped_us, kept, waited_us] = super::xmem::take_view_stats();
+            let [made, made_us, unmapped_us, kept, waited_us, overlaps] = super::xmem::take_view_stats();
             if made + kept + waited_us > 0 {
+                let (given, reused, in_use, highest) = super::xmem::page_number_stats();
                 tracing::info!(
                     "dstorage, views of physical pages in the last {:.1} s: {made} made for one write ({:.0} ms mapping and \
                      committing, {:.0} ms unmapping), {kept} writes through kept views; the page table's lock waited for \
-                     {:.0} ms (all threads)",
+                     {:.0} ms (all threads); {overlaps} writes met another in flight on the same pages and took a view of \
+                     their own; physical page numbers: {given} given out since the start ({reused} of them again), {in_use} \
+                     in use, the highest {highest:#x} of the title's {:#x}",
                     elapsed.as_secs_f64(),
                     made_us as f64 / 1e3,
                     unmapped_us as f64 / 1e3,
                     waited_us as f64 / 1e3,
+                    1usize << 25,
                 );
             }
             self.done = Default::default();

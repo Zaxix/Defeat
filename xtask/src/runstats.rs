@@ -83,7 +83,23 @@ struct Run {
     /// views made for one write, ms mapping and committing, ms unmapping,
     /// writes through kept views, ms the page table's lock waited).
     views: Vec<[f64; 6]>,
+    /// Each frame's time, per 5 s line: (seconds, frames, draws a frame,
+    /// longest ms, frames in each bucket of `FRAME_BUCKETS`).
+    each: Vec<Each>,
 }
+
+/// One "each frame's time" line.
+#[derive(Debug, Clone, PartialEq)]
+struct Each {
+    secs: f64,
+    frames: f64,
+    draws: f64,
+    longest: f64,
+    buckets: Vec<f64>,
+}
+
+/// The engine's bucket bounds, ms (the last bucket is open).
+const FRAME_BUCKETS: [&str; 10] = ["<34", "<50", "<75", "<100", "<150", "<200", "<300", "<500", "<1000", "1000+"];
 
 /// The parts of the storage split, as its line names them.
 const STORAGE_PARTS: [&str; 6] = [
@@ -200,6 +216,24 @@ fn parse(text: &str) -> Run {
         } else if line.contains("the card per frame (") && line.contains("a list of ours running ") {
             if let Some(running) = after(&line, "a list of ours running ") {
                 meter.push((at, running, 0.0));
+            }
+        } else if line.contains("each frame's time in the last ") {
+            let buckets: Vec<f64> = line
+                .rsplit(": ")
+                .next()
+                .unwrap_or("")
+                .trim()
+                .split('/')
+                .filter_map(|b| b.parse().ok())
+                .collect();
+            if let (Some(secs), Some(frames), Some(draws), Some(longest)) = (
+                after(&line, "in the last "),
+                after(&line, " s ("),
+                after(&line, " frames, "),
+                after(&line, "longest "),
+            ) && buckets.len() == FRAME_BUCKETS.len()
+            {
+                run.each.push(Each { secs, frames, draws, longest, buckets });
             }
         } else if line.contains("dstorage, views of physical pages in the last ") {
             let secs = after(&line, "in the last ").unwrap_or(0.0);
@@ -432,6 +466,44 @@ fn report(path: &Path, run: &Run, guard_s: f64) -> String {
             .collect();
         out.push_str(&format!("  storage requests of 250 ms or more ({n:.0}), on average, ms: {}\n", avg.join(", ")));
     }
+    if !run.each.is_empty() {
+        out.push_str("  each frame's time (not the frame lines' averages), lines by draws per frame:\n");
+        for (name, lo, hi) in BANDS {
+            let lines: Vec<&Each> = run.each.iter().filter(|e| e.draws >= lo && e.draws < hi).collect();
+            let frames: f64 = lines.iter().map(|e| e.frames).sum();
+            if frames == 0.0 {
+                continue;
+            }
+            let secs: f64 = lines.iter().map(|e| e.secs).sum();
+            let mut buckets = [0.0; FRAME_BUCKETS.len()];
+            for e in &lines {
+                for (b, n) in buckets.iter_mut().zip(&e.buckets) {
+                    *b += n;
+                }
+            }
+            // The bucket holding the median frame.
+            let mut seen = 0.0;
+            let median = FRAME_BUCKETS
+                .iter()
+                .zip(buckets)
+                .find(|&(_, n)| {
+                    seen += n;
+                    seen >= frames / 2.0
+                })
+                .map_or("-", |(name, _)| name);
+            let over = |from: usize| buckets[from..].iter().sum::<f64>() / frames * 100.0;
+            let longest = lines.iter().map(|e| e.longest).fold(0.0, f64::max);
+            out.push_str(&format!(
+                "    {name}: {frames:.0} frames in {secs:.0} s = {:.2} fps ({:.0} % of 30); median frame {median} ms; \
+                 over 50 ms {:.1} %, over 100 ms {:.1} %, over 300 ms {:.1} %; longest {longest:.0} ms\n",
+                frames / secs,
+                frames / secs / 30.0 * 100.0,
+                over(1),
+                over(3),
+                over(7)
+            ));
+        }
+    }
     if !run.views.is_empty() {
         let sum = |k: usize| run.views.iter().map(|v| v[k]).sum::<f64>();
         let minutes = (sum(0) / 60.0).max(1e-9);
@@ -522,6 +594,25 @@ switches       VICTORY_BVH_BUILDER=0 VICTORY_WRITE_PLAIN=alt\n\
         assert_eq!(run.frames[0].card_running, Some(61.5));
         assert_eq!(run.storage_parts, [(10.0, [2000.0, 1.0, 300.0, 2.0, 200.0, 0.0])]);
         assert_eq!(run.reuse, [[30.0, 12.0, 15.0, 3.0]]);
+    }
+
+    #[test]
+    fn the_each_frame_line_is_read() {
+        let log = "2026-11-28T03:10:00.000000Z  INFO victory_gpu::host: each frame's time in the last 5.0 s (31 frames, 4800 draws/frame): median 150.1 ms, p90 180.0, p95 190.0, p99 400.0, longest 420.5; frames over 50 ms 31, over 100 ms 30, over 250 ms 1, over 1 s 0; by ms under 34/50/75/100/150/200/300/500/1000/more: 0/0/0/1/15/14/0/1/0/0\n";
+        let run = parse(log);
+        assert_eq!(
+            run.each,
+            [Each {
+                secs: 5.0,
+                frames: 31.0,
+                draws: 4800.0,
+                longest: 420.5,
+                buckets: vec![0.0, 0.0, 0.0, 1.0, 15.0, 14.0, 0.0, 1.0, 0.0, 0.0]
+            }]
+        );
+        let text = report(Path::new("x"), &run, 4.0);
+        assert!(text.contains("31 frames in 5 s = 6.20 fps"), "{text}");
+        assert!(text.contains("median frame <150 ms"), "{text}");
     }
 
     #[test]

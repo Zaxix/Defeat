@@ -52,11 +52,11 @@ pub enum GpuAccess {
 impl GpuAccess {
     const ALL: [GpuAccess; 4] = [GpuAccess::None, GpuAccess::Read, GpuAccess::ReadWrite, GpuAccess::Unstated];
 
-    fn index(self) -> usize {
+    pub(crate) fn index(self) -> usize {
         self as usize
     }
 
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             GpuAccess::None => "none",
             GpuAccess::Read => "read",

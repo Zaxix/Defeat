@@ -11075,6 +11075,58 @@ struct Meter {
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+    /// Each frame's time since the last frame line ([`frame_times_line`]).
+    times: FrameTimes,
+}
+
+/// Each presented frame's time, not a window's average (R75: the frame
+/// line's figure is a second's mean and hides single long frames).
+struct FrameTimes {
+    last: std::time::Instant,
+    since: std::time::Instant,
+    drawn: u64,
+    ms: Vec<f32>,
+}
+
+/// Upper bounds of the frame-time buckets, ms (the last one is open).
+const FRAME_BUCKETS: [f32; 9] = [34.0, 50.0, 75.0, 100.0, 150.0, 200.0, 300.0, 500.0, 1000.0];
+
+/// The line of each frame's time since the last one, then a fresh start.
+fn frame_times_line(t: &mut FrameTimes) {
+    let now = std::time::Instant::now();
+    let secs = now.duration_since(t.since).as_secs_f64();
+    let drawn = crate::draw::drawn();
+    let n = t.ms.len();
+    if n > 0 {
+        let draws = (drawn - t.drawn) as f64 / n as f64;
+        let mut sorted = t.ms.clone();
+        sorted.sort_by(f32::total_cmp);
+        let at = |q: f64| sorted[((n - 1) as f64 * q).round() as usize];
+        let over = |ms: f32| t.ms.iter().filter(|&&x| x > ms).count();
+        let mut buckets = [0usize; FRAME_BUCKETS.len() + 1];
+        for &x in &t.ms {
+            buckets[FRAME_BUCKETS.iter().position(|&b| x < b).unwrap_or(FRAME_BUCKETS.len())] += 1;
+        }
+        let buckets: Vec<String> = buckets.iter().map(|b| b.to_string()).collect();
+        tracing::info!(
+            "each frame's time in the last {secs:.1} s ({n} frames, {draws:.0} draws/frame): median {:.1} ms, p90 {:.1}, \
+             p95 {:.1}, p99 {:.1}, longest {:.1}; frames over 50 ms {}, over 100 ms {}, over 250 ms {}, over 1 s {}; \
+             by ms under 34/50/75/100/150/200/300/500/1000/more: {}",
+            at(0.5),
+            at(0.9),
+            at(0.95),
+            at(0.99),
+            sorted[n - 1],
+            over(50.0),
+            over(100.0),
+            over(250.0),
+            over(1000.0),
+            buckets.join("/")
+        );
+    }
+    t.ms.clear();
+    t.since = now;
+    t.drawn = drawn;
 }
 
 impl Meter {
@@ -11088,6 +11140,12 @@ impl Meter {
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
+            times: FrameTimes {
+                last: now,
+                since: now,
+                drawn: crate::draw::drawn(),
+                ms: Vec::with_capacity(512),
+            },
         }
     }
 
@@ -11098,6 +11156,12 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
+        {
+            let now = std::time::Instant::now();
+            let ms = now.duration_since(self.times.last).as_secs_f32() * 1000.0;
+            self.times.ms.push(ms);
+            self.times.last = now;
+        }
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
@@ -11285,6 +11349,7 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            frame_times_line(&mut self.times);
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
@@ -11312,7 +11377,8 @@ impl Meter {
                      as read through a table, {parts} uploads of textures not all mapped ({tails} of them without their first page), \
                      {same} looks that found no more mapped; {} slots made stale by a newer view of other memory there, \
                      {} ranges of memory mapped, unmapped or written under texture views ({} dropped), {} slots made due by them, \
-                     {} made slots found unmapped and made null",
+                     {} made slots found unmapped and made null; found changed after their upload with nothing told, by the GPU \
+                     access the title set on their memory: none {}, read {}, read-write {}, unstated {}",
                     crate::draw::HEAP_TEXTURES_TABLED.load(Ordering::Relaxed),
                     crate::descriptor::host::TABLED_WRITES[0].load(Ordering::Relaxed),
                     crate::descriptor::host::TABLED_WRITES[1].load(Ordering::Relaxed),
@@ -11320,7 +11386,11 @@ impl Meter {
                     crate::descriptor::host::STALE[1].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[2].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
-                    crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
+                    crate::descriptor::host::STALE[4].load(Ordering::Relaxed),
+                    crate::draw::HEAP_TEXTURES_CHANGED_BY[0].load(Ordering::Relaxed),
+                    crate::draw::HEAP_TEXTURES_CHANGED_BY[1].load(Ordering::Relaxed),
+                    crate::draw::HEAP_TEXTURES_CHANGED_BY[2].load(Ordering::Relaxed),
+                    crate::draw::HEAP_TEXTURES_CHANGED_BY[3].load(Ordering::Relaxed)
                 );
             }
             {

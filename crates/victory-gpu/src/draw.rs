@@ -1008,6 +1008,11 @@ fn recheck_every() -> u64 {
 /// was, and that found it changed (uploaded again), since the start.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
+/// Textures picked by index found changed after their upload, by the GPU
+/// access the title set on their memory (`gpu_access::GpuAccess::index`:
+/// none, read, read-write, unstated).
+pub(crate) static HEAP_TEXTURES_CHANGED_BY: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
 /// Uploads of textures already on the card made while it had no room for
 /// new ones, since the start.
 pub(crate) static HEAP_TEXTURES_REUPLOADED_FULL: AtomicU64 = AtomicU64::new(0);
@@ -3083,11 +3088,18 @@ impl State {
                     again_in = 1;
                 }
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
+                // Who could have written it (R75): what the title said the
+                // GPU may do with that memory. Read-write is a render or
+                // shader target, whose bytes our copying back brings; none
+                // or read leaves the title's own threads or a remap.
+                let access = crate::gpu_access::gpu_access(at as usize, len as usize);
+                HEAP_TEXTURES_CHANGED_BY[access.index()].fetch_add(1, Ordering::Relaxed);
                 if n < 200 || n.is_multiple_of(1000) {
                     tracing::warn!(
                         slot = index,
                         address = format_args!("{at:#x}"),
                         bytes = len,
+                        gpu_access = access.name(),
                         frames_after_upload = frame.saturating_sub(uploaded),
                         looks,
                         changed = n + 1,
