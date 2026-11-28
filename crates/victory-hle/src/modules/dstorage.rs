@@ -1890,7 +1890,7 @@ mod tests {
             for _ in 0..READS {
                 let id = rng.next() % queues;
                 let size = 4096u32 << (rng.next() % 11);
-                let options = if rng.next() % 2 == 0 { ZLIB } else { 0 };
+                let options = if rng.next().is_multiple_of(2) { ZLIB } else { 0 };
                 read(&mut l, id, options, size);
             }
             (0..queues).for_each(|id| l.submit(id));

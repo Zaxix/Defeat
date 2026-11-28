@@ -6247,8 +6247,8 @@ mod word_run_tests {
             let mut i = 0;
             while i < n {
                 let change = match kind {
-                    0 => rng.next() % 200 == 0,
-                    1 => rng.next() % 3 == 0,
+                    0 => rng.next().is_multiple_of(200),
+                    1 => rng.next().is_multiple_of(3),
                     _ => (i / 64) % 4 == 0,
                 };
                 if change {
