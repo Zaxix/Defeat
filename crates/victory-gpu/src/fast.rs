@@ -51,7 +51,11 @@
 //!   in place, the kernel's write behind it for a page that is not there
 //!   (run 14: 139 ms a frame of the card copies' merges went to writing
 //!   back, most stretches one `NtWriteVirtualMemory` per run of words;
-//!   untried on the owner's PC before run 15, which has it `alt`).
+//!   untried on the owner's PC before run 15, which has it `alt`);
+//! - `VICTORY_GUARD_MARKS`: a write told before it lands (`watch::writing`,
+//!   2,000 a frame: write-backs and storage) looks at lock-free marks of
+//!   the guarded blocks and takes the guards' lock only if one is there
+//!   (run 16: 49 ms a frame of waiting for that lock there, all threads).
 //!
 //! `SETTLE_ROOM`, `LOOKUP_CACHE`, `PARALLEL_REFRESH`, `CARD_SYNC_BATCH` and
 //! `WRITE_PLAIN` also take `alt` (twenty seconds each way, in turn).
@@ -62,7 +66,7 @@
 use std::sync::OnceLock;
 
 /// The switches [`on`] gives a default to, for the start-up line.
-const SWITCHES: [&str; 15] = [
+const SWITCHES: [&str; 16] = [
     "VICTORY_ASYNC_SUBMIT",
     "VICTORY_QUEUE2",
     "VICTORY_COPY_PLAIN",
@@ -78,6 +82,7 @@ const SWITCHES: [&str; 15] = [
     "VICTORY_CARD_SYNC_BATCH",
     "VICTORY_REFRESH_PAGES",
     "VICTORY_WRITE_PLAIN",
+    "VICTORY_GUARD_MARKS",
 ];
 
 /// Whether the faster defaults hold (`VICTORY_FAST`, unset or anything but

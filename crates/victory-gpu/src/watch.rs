@@ -842,6 +842,56 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     holes: BTreeSet::new(),
 });
 
+/// Whether [`writing`] looks at [`MARKS`] before taking the guards' lock
+/// (`VICTORY_GUARD_MARKS`; on with the faster defaults, `=0` off).
+fn marks_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::fast::on("VICTORY_GUARD_MARKS"))
+}
+
+/// Slots of [`MARKS`]: blocks are counted at `block % MARK_SLOTS`, so two
+/// blocks 64 GiB apart share a slot (a false "marked": the lock is taken,
+/// as before).
+const MARK_SLOTS: usize = 1 << 20;
+
+/// For every block that is guarded (`Guards::protected`) or another view's
+/// alias (`Guards::aliased`), one count at its slot, kept under the guards'
+/// lock: raised before a block turns read-only, lowered after it turns
+/// writable again. A range whose slots are all zero has no such block, so
+/// [`open`] would do nothing there: [`writing`] then leaves the lock alone.
+/// A block guarded after that look is the same as one guarded after the
+/// lock is let go, as before: a store faults into the handler; a kernel
+/// write there fails as it did.
+static MARKS: [std::sync::atomic::AtomicU32; MARK_SLOTS] = [const { std::sync::atomic::AtomicU32::new(0) }; MARK_SLOTS];
+
+/// [`writing`]'s calls that found nothing marked and those that took the
+/// lock, since the last line.
+static WRITING: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Under the guards' lock: `block` joins (or leaves) the guarded or
+/// aliased blocks.
+fn mark(block: usize, on: bool) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let slot = &MARKS[block % MARK_SLOTS];
+    if on {
+        slot.fetch_add(1, SeqCst);
+    } else {
+        // (Never below zero: every lowering follows its raising.)
+        let _ = slot.fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1));
+    }
+}
+
+/// Whether no block of `[start, end)` is marked, known without the lock;
+/// false (ask under the lock) for long ranges or with the switch off.
+fn unmarked(start: usize, end: usize) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    if !marks_on() || start >= end {
+        return false;
+    }
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    last - first <= 64 && (first..last).all(|b| MARKS[b % MARK_SLOTS].load(SeqCst) == 0)
+}
+
 /// The guards' lock, timed by the line of the caller: how long each place
 /// waited for it and held it ([`guards_line`]). Run 15's DirectStorage
 /// requests into physical pages spent 200-450 ms each telling the GPU side
@@ -930,9 +980,11 @@ pub(crate) fn guards_line(frames: f64) {
     let by_held = show(&rows);
     rows.sort_by_key(|r| std::cmp::Reverse(r.1[1]));
     let by_waited = show(&rows);
+    let [free, locked] = [0, 1].map(|i| WRITING[i].swap(0, Relaxed) as f64 / frames);
     tracing::info!(
         "the write-watch guards' lock per frame, ms, all threads (by the line in watch.rs that takes it): waited {waited:.1}, \
-         held {held:.1}; held longest: {by_held}; waited longest: {by_waited}"
+         held {held:.1}; held longest: {by_held}; waited longest: {by_waited}; writes told before (`writing`) per frame: \
+         {free:.0} found nothing guarded without the lock (VICTORY_GUARD_MARKS), {locked:.0} took it"
     );
 }
 
@@ -1678,7 +1730,9 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
             ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             for alias in shown {
                 let alias = alias / BLOCK;
-                g.aliased.insert(alias);
+                if g.aliased.insert(alias) {
+                    mark(alias, true);
+                }
                 if alias != block {
                     protect_alias(g, alias);
                 }
@@ -1716,6 +1770,8 @@ fn protect_alias(g: &mut Guards, block: usize) {
     if g.protected.contains(&block) {
         return;
     }
+    // Marked before it turns read-only ([`MARKS`]).
+    mark(block, true);
     let mut old = 0;
     // SAFETY: title view memory; only its protection changes.
     if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
@@ -1723,6 +1779,8 @@ fn protect_alias(g: &mut Guards, block: usize) {
         if view_known() {
             g.viewed.insert(block);
         }
+    } else {
+        mark(block, false);
     }
 }
 
@@ -1748,6 +1806,12 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
             g.viewed.extend(from..to);
         }
     };
+    // Marked before they turn read-only ([`MARKS`]): the blocks not
+    // guarded already, in order.
+    let new: Vec<usize> = (from..to).filter(|b| !g.protected.contains(b)).collect();
+    for &block in &new {
+        mark(block, true);
+    }
     if set(from, to) {
         note(g, from, to);
         return;
@@ -1756,6 +1820,9 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         if set(block, block + 1) {
             note(g, block, block + 1);
         } else {
+            if new.binary_search(&block).is_ok() {
+                mark(block, false);
+            }
             #[cfg(feature = "diagnostics")]
             let error = std::io::Error::last_os_error();
             if block < uncommitted_end(block) {
@@ -1814,13 +1881,17 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     }
     let aliased: Vec<usize> = g.aliased.range(start / BLOCK..end.div_ceil(BLOCK)).copied().collect();
     for block in aliased {
-        g.aliased.remove(&block);
+        if g.aliased.remove(&block) {
+            mark(block, false);
+        }
         for alias in crate::inplace::pages_of(block * BLOCK) {
             if alias / BLOCK != block && open_here(g, alias, alias.saturating_add(BLOCK)) {
                 #[cfg(feature = "diagnostics")]
                 ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            g.aliased.remove(&(alias / BLOCK));
+            if g.aliased.remove(&(alias / BLOCK)) {
+                mark(alias / BLOCK, false);
+            }
         }
     }
     any
@@ -1839,6 +1910,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
             PUBLISHED.clear(first);
             let mut old = 0;
             unsafe { VirtualProtect((first * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+            mark(first, false);
             return true;
         }
         return false;
@@ -1857,6 +1929,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        mark(block, false);
     }
     !blocks.is_empty()
 }
@@ -1867,7 +1940,16 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
-    open(&mut guards(), at, at.saturating_add(len));
+    let end = at.saturating_add(len);
+    if unmarked(at, end) {
+        // No block there is guarded or another's alias: `open` would do
+        // nothing, so the lock is not taken (run 16: this line waited 49 ms
+        // a frame for it, all threads).
+        WRITING[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        WRITING[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        open(&mut guards(), at, end);
+    }
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
 }
@@ -2108,13 +2190,16 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let blocks: Vec<usize> = g.protected.range(range).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
+        mark(block, false);
         g.clean.remove(&block);
         // What it shows is new ([`PUBLISHED`]).
         PUBLISHED.clear(block);
     }
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
-        g.aliased.remove(&block);
+        if g.aliased.remove(&block) {
+            mark(block, false);
+        }
     }
     if view_known() {
         // The runtime calls this for two things only (`xmem`: `map` and
@@ -2241,6 +2326,42 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// The marks follow the guards: a guarded range is marked, so a write
+    /// told there takes the lock and opens it; once open it is unmarked,
+    /// and a second write told there passes without the lock.
+    #[test]
+    fn marks_follow_the_guards() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
+        };
+        if !marks_on() {
+            return;
+        }
+        // SAFETY: a pagefile section of ours, mapped read-write, let go below.
+        let view = unsafe {
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, (4 * PAGE) as u32, std::ptr::null());
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 4 * PAGE).Value as usize
+        };
+        assert_ne!(view, 0);
+        let end = view + 4 * PAGE;
+        assert!(guard(view, end).is_some());
+        assert!(!unmarked(view, end), "guarded: marked");
+        assert!(!unmarked(view + PAGE + 5, view + PAGE + 9), "one guarded block is enough");
+        writing(view + PAGE + 5, 4);
+        assert!(!unmarked(view, end), "the other blocks stay guarded");
+        assert!(unmarked(view + PAGE, view + 2 * PAGE), "the opened block is not marked");
+        // The opened block is reported written; the write went through.
+        // SAFETY: our view, opened above.
+        unsafe { ((view + PAGE + 5) as *mut u32).write_unaligned(7) };
+        assert_eq!(guard(view, end), Some(vec![view / PAGE + 1]));
+        assert!(!unmarked(view + PAGE, view + 2 * PAGE), "guarded again: marked again");
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+        title_memory_remapped(view, 4 * PAGE);
+        assert!(unmarked(view, end), "forgotten with the mapping");
     }
 
     /// Research R64/C: the guards under load, as in a world frame of run
