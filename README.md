@@ -88,29 +88,14 @@ status table).
 
 ### Frame rate in the world, and how far to 30 fps
 
-The median frame time of the frame lines with 3,000 or more draws (the game world; menus and
-loading screens run at 30 fps and are left out), turned into frames a second. Runs before 12 are
-from frame lines of over 300 draws, so they read a little faster than the world band would. Runs
-went to different places in the game, so a run against the one before is a hint, not a
-measurement; `cargo xtask runstats run.txt` makes these tables from a log, by draws per frame and
-by the phases of any `VICTORY_X=alt` switch.
-
-| Run | Where | World frame, median | World fps | Of 30 fps |
-|---|---|---|---|---|
-| 2-6 | First world frames, the cutscene | 360-10,000 ms | 0.1-2.8 | under 10 % |
-| 8 | The cutscene | 612 ms (300+ draws) | 1.6 | 5 % |
-| 9 | The cutscene | 583 ms (300+ draws) | 1.7 | 6 % |
-| 10 | The prison yard | 225 ms (300+ draws) | 4.4 | 15 % |
-| 11 | The prison | 195 ms (300+ draws) | 5.1 | 17 % |
-| 12 | The prison | 167 ms | 6.0 | 20 % |
-| 13 | Cells and yard (translation running) | 238 ms | 4.2 | 14 % |
-| 14 | Cutscene, cells, corridor, office | 229 ms | 4.4 | 15 % |
-| 15 | Bar cutscene, cells, corridor, day room | 203 ms | 4.9 | 16 % |
-
-30 fps is 33 ms a frame: about 170 ms of today's ~200 ms has to go. Where it goes now (run 15,
-world frames, medians; the parts run side by side on several threads): preparing the card's work
-about 110 ms, copying its results back about 76 ms, and the card stands idle about 100 ms a frame
-waiting for us, so the card is not what holds the frame rate back.
+**Best so far: 6.0 fps in the world, 20 % of the way to 30 fps** (run 12: the median frame of
+the frame lines with 3,000 or more draws was 167 ms; menus and loading screens run at 30 fps and
+are left out). 30 fps is 33 ms a frame, so about 135 ms a frame still has to go. Where a world
+frame goes now (run 15, medians; the parts run side by side on several threads): preparing the
+card's work about 110 ms, copying its results back about 76 ms, and the card stands idle about
+100 ms a frame waiting for us, so the card is not what holds the frame rate back.
+`cargo xtask runstats run.txt` reads a run log into these figures (by draws per frame, and by the
+phases of any `VICTORY_X=alt` switch).
 
 | Run (2026-11-27) | Got to | Frame rate | What the log showed | Fixed since |
 |---|---|---|---|---|
