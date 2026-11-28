@@ -1859,6 +1859,78 @@ mod tests {
         assert!(started[1].abs_diff(started[2]) <= 1, "{started:?}");
     }
 
+    /// Research R64/D: a fixed-seed load through the scheduler as the
+    /// workers see it. 16 workers, 8 to 1,024 queues of all three
+    /// priorities, 20,000 reads of 4 KiB to 4 MiB (half compressed, so they
+    /// take staging), each worker finishing its read after a time that
+    /// grows with its size. Every read starts once, in its queue's order;
+    /// staging never holds more than its bound unless one read alone; no
+    /// worker stands idle while a read could start. The scheduler's own
+    /// cost a start is bounded (run 15's reads waited 1-8 s for a worker:
+    /// this says whether picking the next read could be that).
+    #[test]
+    fn many_queues_and_workers_run_every_read_once_in_order() {
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0
+            }
+        }
+        const WORKERS: usize = 16;
+        const READS: usize = 20_000;
+        for queues in [8u64, 64, 256, 1024] {
+            let mut rng = Rng(queues * 7919);
+            let mut l = lanes(STAGING);
+            for id in 0..queues {
+                l.lanes.insert(id, Lane::new((id % 3) as i8 - 1, u16::MAX));
+            }
+            for _ in 0..READS {
+                let id = rng.next() % queues;
+                let size = 4096u32 << (rng.next() % 11);
+                let options = if rng.next() % 2 == 0 { ZLIB } else { 0 };
+                read(&mut l, id, options, size);
+            }
+            (0..queues).for_each(|id| l.submit(id));
+            // (virtual time it ends, job), at most WORKERS of them.
+            let mut running: Vec<(u64, Job)> = Vec::new();
+            let mut last_seq: HashMap<u64, u64> = HashMap::new();
+            let (mut started, mut now, mut picking, mut picks) = (0usize, 0u64, std::time::Duration::ZERO, 0u32);
+            while started < READS {
+                // Fill every idle worker that can be given a read.
+                while running.len() < WORKERS {
+                    let t = std::time::Instant::now();
+                    let job = l.start();
+                    picking += t.elapsed();
+                    picks += 1;
+                    let Some(job) = job else { break };
+                    assert!(l.staged <= l.staging || running.is_empty(), "staging over its bound with others in flight");
+                    if let Some(&before) = last_seq.get(&job.lane) {
+                        assert!(job.seq > before, "queue {} out of order", job.lane);
+                    }
+                    last_seq.insert(job.lane, job.seq);
+                    let cost = 50 + u64::from(job.request.destination_size) / 4096;
+                    running.push((now + cost, job));
+                    started += 1;
+                }
+                assert!(!running.is_empty(), "{queues} queues: nothing runs and {} reads never start", READS - started);
+                // The worker that finishes first.
+                let i = (0..running.len()).min_by_key(|&i| running[i].0).unwrap_or(0);
+                let (at, job) = running.swap_remove(i);
+                now = at;
+                l.finish(&job, Ok(()));
+            }
+            for (_, job) in running.drain(..) {
+                l.finish(&job, Ok(()));
+            }
+            assert!(l.lanes.values().all(|lane| lane.reads.is_empty() && lane.running.is_empty()));
+            let per_pick = picking.as_secs_f64() * 1e6 / f64::from(picks);
+            assert!(per_pick < 200.0, "{queues} queues: {per_pick:.1} us to pick a read");
+        }
+    }
+
     #[test]
     fn staging_bounds_compressed_bytes_in_flight() {
         let mut l = lanes(100);

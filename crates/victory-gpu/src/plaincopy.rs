@@ -553,6 +553,206 @@ mod tests {
     }
 
     /// Many threads at once, half of them faulting: each gets its own answer.
+    /// A small fixed-seed generator for the store tests.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// Memory reserved and committed read-write, `pages` of 4 KiB. The
+    /// blocks stores faulted in are forgotten first: a test's memory may
+    /// sit where an earlier test's faulted.
+    fn committed(pages: usize) -> *mut u8 {
+        for place in &STORE_RECENT {
+            place.store(0, Relaxed);
+        }
+        // SAFETY: memory of the test's own.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), pages * PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!base.is_null());
+        base.cast()
+    }
+
+    /// Runs of words over `len` bytes, sorted and apart, as a merge makes
+    /// them: `count` at most, each 4 to 64 bytes, from `seed`.
+    fn runs(len: usize, count: usize, seed: u64) -> Vec<(usize, usize)> {
+        let mut rng = Rng(seed);
+        let mut starts: Vec<usize> = (0..count).map(|_| rng.below(len / 4) * 4).collect();
+        starts.sort_unstable();
+        starts.dedup();
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        for s in starts {
+            if out.last().is_some_and(|&(a, n)| s < a + n + 4) {
+                continue;
+            }
+            let n = (4 * (1 + rng.below(16))).min(len - s);
+            out.push((s, n));
+        }
+        out
+    }
+
+    /// The bytes `runs` of `from` put over `before`, as the kernel's write of
+    /// each run would.
+    fn reference(before: &[u8], from: &[u8], runs: &[(usize, usize)]) -> Vec<u8> {
+        let mut out = before.to_vec();
+        for &(off, n) in runs {
+            out[off..off + n].copy_from_slice(&from[off..off + n]);
+        }
+        out
+    }
+
+    /// Runs over 64 KiB pages and 4 KiB boundaries, from many to one: what
+    /// lands is what the runs say, byte for byte, and nothing between them.
+    #[test]
+    fn runs_stored_in_place_are_the_runs_and_nothing_else() {
+        if !store_on() {
+            return;
+        }
+        let len = 3 * 64 * 1024 + 8 * PAGE;
+        for (seed, count) in [(1u64, 1usize), (2, 17), (3, 4_000), (4, 60_000)] {
+            let base = committed(len / PAGE);
+            // SAFETY: committed above.
+            let title = unsafe { std::slice::from_raw_parts_mut(base, len) };
+            let mut rng = Rng(seed * 977);
+            title.iter_mut().for_each(|b| *b = rng.next() as u8);
+            let before = title.to_vec();
+            let from: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+            let runs = runs(len, count, seed);
+            assert!(store_runs(base as usize, &from, &runs), "seed {seed}");
+            assert!(title == reference(&before, &from, &runs).as_slice(), "seed {seed}: {} runs", runs.len());
+            // SAFETY: the test's reservation.
+            unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+        }
+    }
+
+    /// A page in the middle that cannot be written (read-only, or not
+    /// committed): the stores give up without a fault, the page keeps its
+    /// bytes, and the kernel's write the caller falls back to finishes
+    /// every run on the pages that are there, as before the stores in place.
+    #[test]
+    fn a_page_that_cannot_be_written_ends_the_stores_and_the_kernel_finishes() {
+        use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, PAGE_READONLY, VirtualProtect};
+        if !store_on() {
+            return;
+        }
+        for read_only in [true, false] {
+            let pages = 6;
+            let base = committed(pages);
+            let len = pages * PAGE;
+            // SAFETY: committed above.
+            let title = unsafe { std::slice::from_raw_parts_mut(base, len) };
+            title.fill(0x11);
+            let hole = 3 * PAGE..4 * PAGE;
+            // SAFETY: a page of the test's own reservation.
+            unsafe {
+                if read_only {
+                    let mut old = 0;
+                    assert_ne!(VirtualProtect(base.add(hole.start).cast(), PAGE, PAGE_READONLY, &mut old), 0);
+                } else {
+                    assert_ne!(VirtualFree(base.add(hole.start).cast(), PAGE, MEM_DECOMMIT), 0);
+                }
+            }
+            let from = vec![0xEEu8; len];
+            let runs = runs(len, 2_000, 7 + u64::from(read_only));
+            assert!(runs.iter().any(|&(a, n)| a < hole.end && a + n > hole.start), "a run in the hole");
+            assert!(!store_runs(base as usize, &from, &runs), "read_only {read_only}");
+            // The caller's fall-back: the kernel's write, run by run.
+            for &(off, n) in &runs {
+                crate::host::write_mapped(base.wrapping_add(off), from[off..].as_ptr(), n);
+            }
+            for (k, &(off, n)) in runs.iter().enumerate() {
+                for i in off..off + n {
+                    // (The hole is the kernel's to leave or write, as before.)
+                    if !hole.contains(&i) {
+                        // SAFETY: committed and readable.
+                        assert_eq!(unsafe { *base.add(i) }, 0xEE, "run {k}: byte {i} written");
+                    }
+                }
+            }
+            // The block that faulted is left to the kernel a while: no
+            // second fault for it.
+            assert!(!store_runs(base as usize, &from, &runs[..1]));
+            // SAFETY: the test's reservation.
+            unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+        }
+    }
+
+    /// Two views of one section show the same bytes: runs stored through
+    /// one are there through the other.
+    #[test]
+    fn runs_stored_through_one_view_show_through_another() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
+        };
+        if !store_on() {
+            return;
+        }
+        let len = 2 * 64 * 1024;
+        for place in &STORE_RECENT {
+            place.store(0, Relaxed);
+        }
+        // SAFETY: a section and two views of the test's own, let go below.
+        unsafe {
+            let section =
+                CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, len as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let a = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as *mut u8;
+            let b = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as *mut u8;
+            assert!(!a.is_null() && !b.is_null() && a != b);
+            let from: Vec<u8> = (0..len).map(|i| (i * 31 + 7) as u8).collect();
+            let runs = runs(len, 5_000, 11);
+            assert!(store_runs(a as usize, &from, &runs));
+            let shown = std::slice::from_raw_parts(b, len);
+            assert!(shown == reference(&vec![0u8; len], &from, &runs).as_slice());
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: a.cast() });
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: b.cast() });
+            CloseHandle(section);
+        }
+    }
+
+    /// Eight threads store their own runs into the same pages at once (as
+    /// the merging threads do, each its own copy's stretch): every thread's
+    /// runs land, none undoes another's.
+    #[test]
+    fn threads_store_runs_into_the_same_pages_side_by_side() {
+        if !store_on() {
+            return;
+        }
+        let len = 4 * 64 * 1024;
+        let base = committed(len / PAGE) as usize;
+        let all = runs(len, 40_000, 21);
+        let threads: Vec<_> = (0..8usize)
+            .map(|t| {
+                let mine: Vec<(usize, usize)> = all.iter().copied().skip(t).step_by(8).collect();
+                std::thread::spawn(move || {
+                    let from = vec![t as u8 + 1; len];
+                    for _ in 0..50 {
+                        assert!(store_runs(base, &from, &mine));
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        // SAFETY: committed above.
+        let title = unsafe { std::slice::from_raw_parts(base as *const u8, len) };
+        for (k, &(off, n)) in all.iter().enumerate() {
+            assert!(title[off..off + n].iter().all(|&b| b == (k % 8) as u8 + 1), "run {k}");
+        }
+        // SAFETY: the test's reservation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
     #[test]
     fn threads_fault_and_copy_side_by_side() {
         // SAFETY: memory of the test's own.

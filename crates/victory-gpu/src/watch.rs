@@ -2243,6 +2243,95 @@ mod tests {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
+    /// Research R64/C: the guards under load, as in a world frame of run
+    /// 15. Eight storage workers each tell a page before and after writing
+    /// it (`writing`, `title_memory_written`, as DirectStorage does for
+    /// physical pages); four title threads store into guarded pages of
+    /// their own (faulting into the handler); one thread keeps guarding the
+    /// whole view and collecting what was written, as refreshes do. At the
+    /// end every byte is what its writer stored, and every page written is
+    /// among those some guarding reported: no write lost and no write
+    /// undone, whichever thread held the lock. The lock's waits and holds
+    /// by line are what the frame line shows (`guards_line`).
+    #[test]
+    fn writers_and_the_guarding_thread_lose_no_write_under_load() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
+        };
+        const PAGES: usize = 24;
+        // SAFETY: a pagefile section of ours, mapped read-write, let go below.
+        let view = unsafe {
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, (PAGES * PAGE) as u32, std::ptr::null());
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGES * PAGE).Value as usize
+        };
+        assert_ne!(view, 0);
+        let end = view + PAGES * PAGE;
+        assert!(guard(view, end).is_some());
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let reported = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+        let guarding = {
+            let (done, reported) = (done.clone(), reported.clone());
+            std::thread::spawn(move || {
+                while !done.load(Relaxed) {
+                    if let Some(pages) = guard(view, end) {
+                        reported.lock().unwrap().extend(pages);
+                    }
+                }
+            })
+        };
+        // Pages 0-15: eight workers, two pages each; 16-23: four title
+        // threads, two pages each. Byte `i` of a page gets `round + i`.
+        let rounds = 200u32;
+        let writer = |first: usize, told: bool| {
+            std::thread::spawn(move || {
+                for round in 0..rounds {
+                    for page in first..first + 2 {
+                        let at = view + page * PAGE + (round as usize * 4096) % PAGE;
+                        if told {
+                            writing(at, 4096);
+                        }
+                        // SAFETY: 4 KiB of our view; this thread alone writes them.
+                        let bytes = unsafe { std::slice::from_raw_parts_mut(at as *mut u8, 4096) };
+                        bytes.iter_mut().enumerate().for_each(|(i, b)| *b = (round as usize + i) as u8);
+                        if told {
+                            title_memory_written(at, 4096, true);
+                        }
+                    }
+                }
+            })
+        };
+        let threads: Vec<_> = (0..8).map(|w| writer(2 * w, true)).chain((0..4).map(|t| writer(16 + 2 * t, false))).collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        done.store(true, Relaxed);
+        guarding.join().unwrap();
+        // What is left unreported is reported now.
+        reported.lock().unwrap().extend(guard(view, end).unwrap_or_default());
+        let reported = reported.lock().unwrap();
+        for page in 0..PAGES {
+            assert!(reported.contains(&(view / PAGE + page)), "page {page}: written and never reported");
+            // Each 4 KiB piece holds its last round's bytes.
+            for piece in 0..PAGE / 4096 {
+                let last = (0..rounds).rev().find(|r| (*r as usize * 4096) % PAGE == piece * 4096);
+                let Some(last) = last else { continue };
+                let at = view + page * PAGE + piece * 4096;
+                // SAFETY: our view, no writer left.
+                let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, 4096) };
+                assert!(
+                    bytes.iter().enumerate().all(|(i, &b)| b == (last as usize + i) as u8),
+                    "page {page} piece {piece}: a write lost or undone"
+                );
+            }
+        }
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+        title_memory_remapped(view, PAGES * PAGE);
+    }
+
     /// A kernel read into a guarded view block fails; opened first, it
     /// lands and the block counts as written.
     #[test]

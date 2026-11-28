@@ -1381,23 +1381,31 @@ pub(crate) fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> 
 /// other byte of `merged` is the title's as it was read.
 fn word_runs(address: usize, read: &[u8], merged: &[u8], mut put: impl FnMut(usize, usize)) {
     let n = read.len().min(merged.len());
+    let (read, merged) = (&read[..n], &merged[..n]);
     let mut i = 0;
     while i < n {
         // Equal bytes are passed over, 32 at a time while they last.
-        match first_difference(&read[i..n], &merged[i..n]) {
+        match first_difference(&read[i..], &merged[i..]) {
             Some(d) => i += d,
             None => break,
         }
         // From the word that holds this byte (or the stretch's first
-        // byte) to the end of the last word in a row that holds one.
+        // byte) to the end of the last word in a row that holds one: the
+        // first word's end, then whole words compared as numbers (a
+        // slice compare a word was half the time of a dense stretch:
+        // 90 against 46 us for 2,700 runs in 48 KiB), then a part-word
+        // at the stretch's end.
         let first = i - ((address + i) & 3).min(i);
-        let mut end = first;
-        while end < n {
-            let word = (((address + end) | 3) + 1 - address).min(n);
-            if read[end..word] == merged[end..word] {
+        let mut end = (((address + first) | 3) + 1 - address).min(n);
+        while end + 4 <= n {
+            let word = |b: &[u8]| u32::from_ne_bytes([b[end], b[end + 1], b[end + 2], b[end + 3]]);
+            if word(read) == word(merged) {
                 break;
             }
-            end = word;
+            end += 4;
+        }
+        if end < n && end + 4 > n && read[end..] != merged[end..] {
+            end = n;
         }
         put(first, end - first);
         i = end;
@@ -6189,4 +6197,117 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod word_run_tests {
+    use super::{word_runs, write_merged_counted};
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    /// The runs as their definition says, slowly: every 4-byte word of
+    /// title memory (counted from `address`) holding a byte that differs,
+    /// cut to the stretch, neighbouring words joined.
+    fn reference(address: usize, read: &[u8], merged: &[u8]) -> Vec<(usize, usize)> {
+        let n = read.len().min(merged.len());
+        let mut words: Vec<usize> = (0..n).filter(|&i| read[i] != merged[i]).map(|i| (address + i) / 4).collect();
+        words.dedup();
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for w in words {
+            let (a, b) = ((w * 4).max(address) - address, ((w + 1) * 4 - address).min(n));
+            match runs.last_mut() {
+                Some((start, len)) if *start + *len == a => *len = b - *start,
+                _ => runs.push((a, b - a)),
+            }
+        }
+        runs
+    }
+
+    /// Sparse, dense, bursty and unaligned stretches, fixed seeds: the
+    /// merge's runs are exactly the reference's.
+    #[test]
+    fn runs_of_words_are_the_words_that_differ() {
+        for seed in 1..400u64 {
+            let mut rng = Rng(seed * 0x9E37_79B9);
+            let n = 1 + (rng.next() % 3000) as usize;
+            let address = 0x1000_0000 + (rng.next() % 8) as usize;
+            let read: Vec<u8> = (0..n).map(|_| rng.next() as u8).collect();
+            let mut merged = read.clone();
+            // Sparse (1 in 200 bytes), dense (1 in 3), or in bursts.
+            let kind = seed % 3;
+            let mut i = 0;
+            while i < n {
+                let change = match kind {
+                    0 => rng.next() % 200 == 0,
+                    1 => rng.next() % 3 == 0,
+                    _ => (i / 64) % 4 == 0,
+                };
+                if change {
+                    merged[i] = merged[i].wrapping_add(1 + (rng.next() % 255) as u8);
+                }
+                i += 1;
+            }
+            let mut got = Vec::new();
+            word_runs(address, &read, &merged, |off, len| got.push((off, len)));
+            assert_eq!(got, reference(address, &read, &merged), "seed {seed}, {n} bytes at {address:#x}");
+        }
+    }
+
+    /// What a merge writes back: the words the card changed, and nothing
+    /// else, so a title write that landed after the merge read the stretch
+    /// stays wherever the card did not write the same word.
+    #[cfg(windows)]
+    #[test]
+    fn a_title_write_after_the_read_stays_outside_the_card_s_words() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        let len = 2 * 64 * 1024 + 12_288;
+        // SAFETY: memory of the test's own, let go below.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as *mut u8;
+        assert!(!base.is_null());
+        // SAFETY: committed above.
+        let title = unsafe { std::slice::from_raw_parts_mut(base, len) };
+        let mut rng = Rng(77);
+        title.iter_mut().for_each(|b| *b = rng.next() as u8);
+        // The merge reads the stretch (from byte 6: unaligned).
+        let at = 6;
+        let read = title[at..].to_vec();
+        let mut merged = read.clone();
+        let mut card_words = std::collections::HashSet::new();
+        for i in (0..merged.len()).step_by(37) {
+            merged[i] ^= 0x5A;
+            card_words.insert((at + i) / 4);
+        }
+        // The title writes some bytes after that read.
+        let mut title_wrote = Vec::new();
+        for i in (3..merged.len()).step_by(101) {
+            title[at + i] = title[at + i].wrapping_add(1);
+            title_wrote.push(i);
+        }
+        let expected_runs = reference(base as usize + at, &read, &merged);
+        let (written, runs) = write_merged_counted(base as usize + at, Some(&read), &merged);
+        assert_eq!(runs as usize, expected_runs.len());
+        assert_eq!(written, expected_runs.iter().map(|r| r.1).sum::<usize>());
+        for &i in &title_wrote {
+            let word = (base as usize + at + i) / 4;
+            if card_words.contains(&(word - base as usize / 4)) {
+                assert_eq!(title[at + i], merged[i], "byte {i}: a word the card wrote takes the card's");
+            } else {
+                assert_eq!(title[at + i], read[i].wrapping_add(1), "byte {i}: the title's write stays");
+            }
+        }
+        for i in (0..merged.len()).step_by(37) {
+            assert_eq!(title[at + i], merged[i], "byte {i}: the card's byte");
+        }
+        // SAFETY: the test's reservation.
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+    }
 }
