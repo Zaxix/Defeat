@@ -363,6 +363,24 @@ fn report(path: &Path, run: &Run, guard_s: f64) -> String {
             out.push_str(&row(phase, frames));
         }
     }
+    // The slowest world frames, by where their time went: the card idle
+    // while we prepared (behind us), idle while the title had not
+    // submitted (the title's own wait: loading, streaming), or neither.
+    let mut slow: Vec<&Frame> = run.frames.iter().filter(|f| f.draws >= 3000.0).collect();
+    slow.sort_by(|a, b| b.ms.total_cmp(&a.ms));
+    if !slow.is_empty() {
+        out.push_str("  the slowest world frame lines (card idle split: behind us / the title had not submitted):\n");
+        for f in slow.iter().take(8) {
+            let title = match (f.idle, f.idle_submitting) {
+                (Some(i), Some(b)) => format!("{b:.0} / {:.0}", (i - b).max(0.0)),
+                _ => "-".to_owned(),
+            };
+            out.push_str(&format!(
+                "    {:>6.0} ms at {:>5.0} draws: preparing {:>5.0}, copying back {:>4.0}, card idle {title}\n",
+                f.ms, f.draws, f.preparing, f.back_ms
+            ));
+        }
+    }
     if !run.vram.is_empty() {
         let headroom: Vec<f64> = run.vram.iter().map(|v| v.2 - v.1).collect();
         let mut h = headroom.clone();
