@@ -823,6 +823,11 @@ pub(crate) fn write_own(at: usize, bytes: &[u8], runs: Option<&[(usize, usize)]>
         view.committed[block / 64] |= 1u64 << (block % 64);
     }
     let to = view.base + offset as usize;
+    // The copy needs no lock: the view stays mapped for the process's life
+    // and its pages are committed (above). Held, the one lock had every
+    // merging thread's stores wait on each other (run 15: 42 ms a frame,
+    // all threads, in this store or its try).
+    drop(own);
     match runs {
         Some(runs) => {
             for &(off, len) in runs {

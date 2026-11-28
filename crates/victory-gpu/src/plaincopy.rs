@@ -379,6 +379,46 @@ pub(crate) fn store(to: *mut u8, from: *const u8, len: usize) -> bool {
     whole
 }
 
+/// [`store`] for the runs `(offset, bytes)` of `from` going to the same
+/// offsets from `to` (a merge's runs of words, all in one 64 KiB page):
+/// the switch and the recent faults asked once, counted once. False if it
+/// is off or a page faulted (then some runs may have been written: the
+/// caller writes them all again through the kernel).
+pub(crate) fn store_runs(to: usize, from: &[u8], runs: &[(usize, usize)]) -> bool {
+    let (Some(&(first, _)), Some(&(last, last_len))) = (runs.first(), runs.last()) else {
+        return true;
+    };
+    if !store_on() {
+        return false;
+    }
+    let (lo, hi) = blocks(to + first, last + last_len - first);
+    if STORE_RECENT[lo & 1023].load(Relaxed) == lo || STORE_RECENT[hi & 1023].load(Relaxed) == hi {
+        STORES[3].fetch_add(runs.len() as u64, Relaxed);
+        return false;
+    }
+    let mut bytes = 0u64;
+    for &(off, len) in runs {
+        debug_assert!(off + len <= from.len());
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: the source is the caller's host memory (inside `from`);
+        // a destination page that is not there or not writable ends the
+        // store with 0 instead of a fault ([`install`]).
+        let whole = unsafe { victory_store_guarded((to + off) as *mut u8, from.as_ptr().add(off), len) != 0 };
+        #[cfg(not(target_arch = "x86_64"))]
+        let whole = false;
+        if !whole {
+            STORES[2].fetch_add(1, Relaxed);
+            STORE_RECENT[lo & 1023].store(lo, Relaxed);
+            STORE_RECENT[hi & 1023].store(hi, Relaxed);
+            return false;
+        }
+        bytes += len as u64;
+    }
+    STORES[0].fetch_add(runs.len() as u64, Relaxed);
+    STORES[1].fetch_add(bytes, Relaxed);
+    true
+}
+
 /// With the frame line: what [`store`] did per frame over `frames`.
 pub(crate) fn store_line(frames: f64) {
     let [stores, bytes, gone, lately] = [0, 1, 2, 3].map(|i| STORES[i].swap(0, Relaxed) as f64 / frames);

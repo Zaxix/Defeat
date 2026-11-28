@@ -11160,6 +11160,7 @@ impl Meter {
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);
         crate::plaincopy::store_line(frames);
+        crate::watch::guards_line(frames);
         #[cfg(feature = "diagnostics")]
         crate::backreads::line(frames);
         crate::shadow::placed_line();

@@ -842,8 +842,98 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     holes: BTreeSet::new(),
 });
 
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+/// The guards' lock, timed by the line of the caller: how long each place
+/// waited for it and held it ([`guards_line`]). Run 15's DirectStorage
+/// requests into physical pages spent 200-450 ms each telling the GPU side
+/// before and after their write (`writing`, [`title_memory_written`], both
+/// under this lock), and waited seconds for a worker behind them.
+#[track_caller]
+fn guards() -> GuardsHeld {
+    let line = std::panic::Location::caller().line() as usize % GUARD_LINES;
+    let asked = std::time::Instant::now();
+    let guard = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    let got = std::time::Instant::now();
+    let slot = &GUARD_TIMES[line];
+    slot[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    slot[1].fetch_add((got - asked).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    GuardsHeld { guard, line, got }
+}
+
+/// Places that take the guards' lock, by the line of the call in this file.
+const GUARD_LINES: usize = 4096;
+
+/// By the line of [`guards`]' caller: takings, nanoseconds waited for the
+/// lock, held, and the longest held, since the last [`guards_line`].
+static GUARD_TIMES: [[std::sync::atomic::AtomicU64; 4]; GUARD_LINES] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 4] }; GUARD_LINES];
+
+/// The guards held, timed when let go.
+struct GuardsHeld {
+    guard: std::sync::MutexGuard<'static, Guards>,
+    line: usize,
+    got: std::time::Instant,
+}
+
+impl std::ops::Deref for GuardsHeld {
+    type Target = Guards;
+    fn deref(&self) -> &Guards {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for GuardsHeld {
+    fn deref_mut(&mut self) -> &mut Guards {
+        &mut self.guard
+    }
+}
+
+impl Drop for GuardsHeld {
+    fn drop(&mut self) {
+        let held = self.got.elapsed().as_nanos() as u64;
+        let slot = &GUARD_TIMES[self.line];
+        slot[2].fetch_add(held, std::sync::atomic::Ordering::Relaxed);
+        slot[3].fetch_max(held, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// With the frame line: the places that held the guards' lock longest and
+/// waited for it longest, per frame over `frames`.
+pub(crate) fn guards_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut rows: Vec<(usize, [u64; 4])> = GUARD_TIMES
+        .iter()
+        .enumerate()
+        .map(|(line, s)| (line, [0, 1, 2, 3].map(|i| s[i].swap(0, Relaxed))))
+        .filter(|(_, t)| t[0] != 0)
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    let total = |i: usize, rows: &[(usize, [u64; 4])]| rows.iter().map(|r| r.1[i]).sum::<u64>() as f64 / frames / 1e6;
+    let (waited, held) = (total(1, &rows), total(2, &rows));
+    let show = |rows: &[(usize, [u64; 4])]| {
+        rows.iter()
+            .take(6)
+            .map(|(line, t)| {
+                format!(
+                    "line {line}: {:.0} takings, waited {:.1}, held {:.1} (longest {:.1})",
+                    t[0] as f64 / frames,
+                    t[1] as f64 / frames / 1e6,
+                    t[2] as f64 / frames / 1e6,
+                    t[3] as f64 / 1e6
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    rows.sort_by_key(|r| std::cmp::Reverse(r.1[2]));
+    let by_held = show(&rows);
+    rows.sort_by_key(|r| std::cmp::Reverse(r.1[1]));
+    let by_waited = show(&rows);
+    tracing::info!(
+        "the write-watch guards' lock per frame, ms, all threads (by the line in watch.rs that takes it): waited {waited:.1}, \
+         held {held:.1}; held longest: {by_held}; waited longest: {by_waited}"
+    );
 }
 
 /// Whether the block `page` is read-only by our hand and unwritten since a

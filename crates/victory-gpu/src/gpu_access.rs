@@ -216,17 +216,25 @@ static WRITES_AGAINST: AtomicU64 = AtomicU64::new(0);
 /// where the title said the GPU does not write there: the check that has
 /// to come out at zero before the flags may be trusted to skip work.
 pub fn note_gpu_write(at: usize, len: usize) {
-    if len == 0 {
+    note_gpu_writes(at, len, len);
+}
+
+/// [`note_gpu_write`] once for a stretch `[at, at + span)` in which
+/// `bytes` were written (a merge's runs of words): one lookup and one count
+/// where a call a run made tens of thousands a frame on several threads
+/// (run 15: about 54,000 runs a frame).
+pub fn note_gpu_writes(at: usize, span: usize, bytes: usize) {
+    if span == 0 || bytes == 0 {
         return;
     }
-    let access = gpu_access(at, len);
-    COSTS[Cost::WrittenBack as usize][access.index()].fetch_add(len as u64, Ordering::Relaxed);
+    let access = gpu_access(at, span);
+    COSTS[Cost::WrittenBack as usize][access.index()].fetch_add(bytes as u64, Ordering::Relaxed);
     if matches!(access, GpuAccess::None | GpuAccess::Read) {
         let n = WRITES_AGAINST.fetch_add(1, Ordering::Relaxed);
         if n < 16 {
             tracing::warn!(
                 at = format_args!("{at:#x}"),
-                len,
+                len = span,
                 said = access.name(),
                 "GPU write into title memory the title marked as not GPU-written"
             );

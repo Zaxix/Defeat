@@ -617,7 +617,8 @@ impl Lanes {
         }
         let ms = started.elapsed().as_millis() as u64;
         let bc = job.request.options & BCPACK != 0;
-        if ms > self.slowest.0 {
+        let slowest = ms > self.slowest.0;
+        if slowest {
             self.slowest = (ms, job.request.destination_size, job.request.options);
         }
         let parts = {
@@ -629,7 +630,9 @@ impl Lanes {
             parts[5] = total.saturating_sub(run.iter().sum());
             parts
         };
-        if ms > self.slowest.0 {
+        // (Run 15's line showed zeros: this asked `ms > slowest` after the
+        // slowest had been set to this request.)
+        if slowest {
             self.slowest_parts = parts;
         }
         if ms >= 250 {

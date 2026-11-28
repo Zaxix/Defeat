@@ -1454,14 +1454,29 @@ fn write_merged(address: usize, read: Option<&[u8]>, merged: &[u8]) -> usize {
 fn write_merged_counted(address: usize, read: Option<&[u8]>, merged: &[u8]) -> (usize, u64) {
     match read {
         Some(read) if merge_words_on() => {
-            let (mut written, mut runs) = (0, 0);
-            word_runs(address, read, merged, |off, len| {
-                crate::host::write_mapped((address + off) as *mut u8, merged[off..].as_ptr(), len);
-                crate::gpu_access::note_gpu_write(address + off, len);
-                written += len;
-                runs += 1;
-            });
-            (written, runs)
+            // The runs first, then stored in one go (in place, asked and
+            // counted once: `plaincopy::store_runs`) and noted once: per run,
+            // run 15's ~54,000 a frame each asked the switch, the faults and
+            // the access table and bumped shared counters, on every merging
+            // thread.
+            let mut runs: Vec<(usize, usize)> = Vec::new();
+            word_runs(address, read, merged, |off, len| runs.push((off, len)));
+            let written: usize = runs.iter().map(|r| r.1).sum();
+            if let (Some(&(first, _)), Some(&(last, last_len))) = (runs.first(), runs.last()) {
+                if crate::plaincopy::store_runs(address, merged, &runs) {
+                    // What `write_mapped` tells the back-reads count.
+                    #[cfg(feature = "diagnostics")]
+                    for &(off, len) in &runs {
+                        crate::backreads::touched(address + off, len, true);
+                    }
+                } else {
+                    for &(off, len) in &runs {
+                        crate::host::write_mapped((address + off) as *mut u8, merged[off..].as_ptr(), len);
+                    }
+                }
+                crate::gpu_access::note_gpu_writes(address + first, last + last_len - first, written);
+            }
+            (written, runs.len() as u64)
         }
         _ => (write_merged(address, None, merged), 1),
     }
@@ -3839,12 +3854,23 @@ impl Shadow {
                 // Only the GPU's bytes (upstream #2009): the rest of the
                 // stretch is the title's as read, and a title write landing
                 // there since stays.
-                for &(off, len) in &runs {
-                    crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
-                    crate::gpu_access::note_gpu_write(start + at + off, len);
-                    self.wrote_back(len);
-                    written += len;
+                // In one go where it can be (`write_merged_counted`'s way).
+                if crate::plaincopy::store_runs(start + at, &title, &runs) {
+                    #[cfg(feature = "diagnostics")]
+                    for &(off, len) in &runs {
+                        crate::backreads::touched(start + at + off, len, true);
+                    }
+                } else {
+                    for &(off, len) in &runs {
+                        crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
+                    }
                 }
+                let bytes: usize = runs.iter().map(|r| r.1).sum();
+                if let (Some(&(first, _)), Some(&(last, last_len))) = (runs.first(), runs.last()) {
+                    crate::gpu_access::note_gpu_writes(start + at + first, last + last_len - first, bytes);
+                }
+                self.wrote_back(bytes);
+                written += bytes;
             }
             // Our write shows as a title write at the copy's next refresh,
             // which copies those pages once more (some dozens of MB a
