@@ -767,7 +767,7 @@ struct Guards {
     /// Blocks we made read-only.
     protected: BTreeSet<usize>,
     /// Of those, the ones not written since a copy took them.
-    clean: BTreeSet<usize>,
+    clean: crate::spans::Spans,
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: BTreeSet<usize>,
@@ -834,7 +834,7 @@ fn view_known() -> bool {
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
-    clean: BTreeSet::new(),
+    clean: crate::spans::Spans::new(),
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
     viewed: BTreeSet::new(),
@@ -1462,7 +1462,7 @@ pub(crate) fn unchanged_known(start: usize, end: usize, base: usize, copied: &[u
     // guards'.)
     let g = guards();
     let blocks = last - first;
-    g.protected.range(first..last).count() == blocks && g.clean.range(first..last).count() == blocks
+    g.clean.covers(first..last) && g.protected.range(first..last).count() == blocks
 }
 
 /// `VICTORY_ABSENT_ONCE`: 0 off, 1 on, 2 in turn ([`absent_once`]).
@@ -1597,24 +1597,36 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    // The range's clean blocks, in order: read off the set in one pass,
-    // not looked up one block at a time. A frame asks about some 10 GB of
-    // view memory, 150,000 blocks, nearly all clean: the lookups were most
-    // of the 60-90 ms a frame of "guards" (run 54). What the loop adds to
-    // the set meanwhile is the block it stands at or ones before it.
-    let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
-    if clean.len() == last - first {
+    // The range's clean blocks, as runs ([`crate::spans`]): a frame asks
+    // about some 10 GB of view memory, 150,000 blocks, nearly all clean,
+    // and copying them out one by one held the lock 19 ms a frame with
+    // the write-fault handler waiting behind it (run 18). Now the
+    // all-clean case is one lookup and the walk steps over each clean run
+    // at once. What the loop adds to the set meanwhile is the block it
+    // stands at or ones before it.
+    if g.clean.covers(first..last) {
         // Nothing written, mapped or new since the range was last taken.
         return Some(written);
     }
+    let clean = g.clean.runs_in(first..last);
     let mut next_clean = 0;
     let mut uncommitted_until = first;
-    for block in first..=last {
-        while next_clean < clean.len() && clean[next_clean] < block {
+    let mut block = first;
+    while block <= last {
+        while next_clean < clean.len() && clean[next_clean].end <= block {
             next_clean += 1;
         }
-        let is_clean = next_clean < clean.len() && clean[next_clean] == block;
-        let mut open = block < last && !is_clean;
+        let is_clean = next_clean < clean.len() && clean[next_clean].start <= block;
+        if is_clean {
+            // The run before it is guarded first, as at any block that is
+            // not opened; then the rest of the clean run is passed over.
+            if let Some(from) = run.take() {
+                protect(&mut g, from, block);
+            }
+            block = clean[next_clean].end;
+            continue;
+        }
+        let mut open = block < last;
         if open && g.absent.contains(&block) {
             // Found uncommitted a moment ago ([`absent_once`]): Windows is
             // not asked again yet. What the runtime maps there it tells,
@@ -1650,12 +1662,14 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
                 g.clean.insert(block);
             } else {
                 run.get_or_insert(block);
+                block += 1;
                 continue;
             }
         }
         if let Some(from) = run.take() {
             protect(&mut g, from, block);
         }
+        block += 1;
     }
     Some(written)
 }
