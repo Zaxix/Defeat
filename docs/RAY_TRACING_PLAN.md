@@ -37,7 +37,8 @@ The game does not use DXR. Its ray tracing is its own compute shaders:
 |---|---|
 | Builder programs translate | all 52 (the base, 2026-11-27 03:45) |
 | Builder runs | only "whole": every builder pipeline needs a host pipeline (`pipeline.rs::Builder`), or none runs (a partly run builder once wrote garbage bounds into title memory and crashed the game) |
-| Walkers translate | 59 of 64 before; the 5 shadow-ray programs (`CS_TraceShadowRays`) now translate (4 of 5 expected; the "Full" one also needs 64-lane waves) |
+| Walkers translate | 63 of 64 in run 14: Eighth, Quarter, Half and Full of the 5 shadow-ray programs (`CS_TraceShadowRays`) translated and got host pipelines, Full (a 64-lane program) too; FullAdaptive (`dbdbf36298727135`) stops at GFX10 0xae80, a lane mask holding lanes outside EXEC read as data (`lower::MASK_ELSEWHERE`) |
+| Walkers run | **not seen yet**: none of the five shadow-ray programs had a first bind in run 14 (builder off); a host pipeline is not proof the pass runs, let alone right |
 | Node test | emulated; with the builder off (`VICTORY_BVH_BUILDER=0`, our runs) every test answers "no hit", so nothing reads garbage |
 | Memory by raw address | `memory.rs`: a directory per 64 KiB page leads shaders to the host copies; pages reached only through pointers read 0 the first frame |
 | **Builder on** | **the game ends itself 30-40 s after the builder starts** (two base runs, with and without quarantine). That is its hang watchdog: the main thread stood still for 30 s |
@@ -109,8 +110,13 @@ main thread stops; what the memory line costs; whether bounce light appears.
 
 ### Step 4: make it right, then fast
 
-- Shadow-ray "Full" (64-lane, `07c93bfb77fecebb`): the paired form, as the
-  water programs; until then it stays held.
+- Shadow-ray "Full" (64-lane, `07c93bfb77fecebb`): has a host pipeline
+  since run 14; its 64-lane results are checked against the CPU reference
+  before it counts as right.
+- Shadow-ray "FullAdaptive" (`dbdbf36298727135`): the lane mask at 0xae80,
+  with a unit test of the mask's lanes, once the builder test shows the
+  title dispatching these passes at all (a translator change remakes every
+  cached translation).
 - Resolve programs back in, one family at a time.
 - Water and the 26 other 64-lane programs: the paired form per hash, each
   checked against the CPU reference before it is on by default.

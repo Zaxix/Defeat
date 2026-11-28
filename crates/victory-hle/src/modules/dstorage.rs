@@ -371,6 +371,46 @@ struct Lanes {
     /// 327, and a status waits for every earlier request of its queue).
     slowest: (u64, u32, u64),
     slow: [u64; 4],
+    /// When each read was handed to the workers, by sequence number, for
+    /// its wait in the queue ([`Job::waited`]).
+    queued: HashMap<u64, std::time::Instant>,
+    /// Since the last 5 s line, for requests of 250 ms or more: their
+    /// count and microseconds by part ([`PARTS`]: the queue wait, then the
+    /// parts of the run); and the slowest's parts.
+    slow_parts: (u64, [u64; PARTS]),
+    slowest_parts: [u64; PARTS],
+}
+
+/// The parts of a request's time the 5 s line splits (R61 asked where the
+/// 1-2 s requests of run 14 spent it, small zlib reads into physical pages
+/// among them): waiting in the queue for a worker, reading the file,
+/// telling the GPU side before the write (and finding the pages' view),
+/// the decode or copy into the destination (file reads made inside it not
+/// counted), telling it after (with the physical pages' write and its
+/// retries where no view shows them), and the rest of the run.
+const PARTS: usize = 6;
+const PART_NAMES: [&str; PARTS] = [
+    "waiting for a worker",
+    "reading the file",
+    "the GPU side told before the write",
+    "decoding or copying",
+    "told after (and physical pages written)",
+    "the rest",
+];
+
+thread_local! {
+    /// This worker's microseconds in parts 1-4 of [`PARTS`] for the request
+    /// it is running.
+    static RUN_PARTS: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
+}
+
+/// Adds to part `part` (1-4 of [`PARTS`]) of the running request.
+fn run_part(part: usize, since: std::time::Instant) {
+    RUN_PARTS.with(|p| {
+        let mut v = p.get();
+        v[part - 1] += since.elapsed().as_micros() as u64;
+        p.set(v);
+    });
 }
 
 /// A queue's requests in the scheduler.
@@ -406,6 +446,8 @@ struct Job {
     seq: u64,
     request: Request,
     staging: u64,
+    /// From the title's Submit (or the queue's own) to a worker taking it.
+    waited: std::time::Duration,
 }
 
 // SAFETY: as for `Lane`.
@@ -437,6 +479,9 @@ fn scheduler() -> Option<&'static Scheduler> {
                     held_line: None,
                     slowest: (0, 0, 0),
                     slow: [0; 4],
+                    queued: HashMap::new(),
+                    slow_parts: Default::default(),
+                    slowest_parts: [0; PARTS],
                 }),
                 work: Condvar::new(),
                 finished: Condvar::new(),
@@ -539,6 +584,7 @@ fn work(scheduler: &'static Scheduler) {
         };
         drop(lanes);
         let started = std::time::Instant::now();
+        RUN_PARTS.with(|p| p.set([0; 4]));
         let result = execute(&job.request);
         walls_request(&job.request, &result, started);
         lanes = scheduler.lock();
@@ -574,8 +620,24 @@ impl Lanes {
         if ms > self.slowest.0 {
             self.slowest = (ms, job.request.destination_size, job.request.options);
         }
+        let parts = {
+            let run = RUN_PARTS.with(std::cell::Cell::get);
+            let total = started.elapsed().as_micros() as u64;
+            let mut parts = [0u64; PARTS];
+            parts[0] = job.waited.as_micros() as u64;
+            parts[1..5].copy_from_slice(&run);
+            parts[5] = total.saturating_sub(run.iter().sum());
+            parts
+        };
+        if ms > self.slowest.0 {
+            self.slowest_parts = parts;
+        }
         if ms >= 250 {
             self.slow[usize::from(bc) * 2] += 1;
+            self.slow_parts.0 += 1;
+            for (sum, part) in self.slow_parts.1.iter_mut().zip(parts) {
+                *sum += part;
+            }
         }
         if ms >= 1000 {
             self.slow[usize::from(bc) * 2 + 1] += 1;
@@ -609,6 +671,24 @@ impl Lanes {
                 slow[1],
                 slow[3],
             );
+            let split = |parts: &[u64; PARTS], of: u64| {
+                PART_NAMES
+                    .iter()
+                    .zip(parts)
+                    .map(|(name, us)| format!("{name} {:.0}", *us as f64 / 1e3 / of.max(1) as f64))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let (n, sums) = std::mem::take(&mut self.slow_parts);
+            let slowest_parts = std::mem::take(&mut self.slowest_parts);
+            if ms >= 250 {
+                tracing::info!(
+                    "dstorage, where the time went, ms: the slowest request (its run; the wait before it apart): {}; the {n} \
+                     requests of 250 ms or more, on average: {}",
+                    split(&slowest_parts, 1),
+                    split(&sums, n)
+                );
+            }
             self.done = Default::default();
             self.bcpack = Default::default();
             self.since = None;
@@ -635,6 +715,7 @@ impl Lanes {
         }
         lane.reads.pop_front();
         lane.running.insert(seq);
+        let waited = self.queued.remove(&seq).map(|at| at.elapsed()).unwrap_or_default();
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
         self.now = self.clock[class];
@@ -646,6 +727,7 @@ impl Lanes {
             seq,
             request,
             staging,
+            waited,
         })
     }
 
@@ -716,7 +798,15 @@ impl Lanes {
             let seq = self.next_seq;
             self.next_seq += 1;
             match command {
-                Command::Read(request) => lane.reads.push_back((seq, request)),
+                Command::Read(request) => {
+                    lane.reads.push_back((seq, request));
+                    // Reads of a queue closed before they ran stay here:
+                    // forgotten in bulk past a bound (their wait unknown).
+                    if self.queued.len() >= 1 << 16 {
+                        self.queued.clear();
+                    }
+                    self.queued.insert(seq, now);
+                }
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
             }
         }
@@ -1257,6 +1347,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         }
     };
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    run_part(1, started);
     result
 }
 
@@ -1278,22 +1369,40 @@ fn into_destination(
     len: usize,
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
+    // The fill's own time, file reads made inside it apart (they are
+    // counted as reading).
+    let fill = |out: &mut [u8]| {
+        let reads = RUN_PARTS.with(std::cell::Cell::get)[0];
+        let at = std::time::Instant::now();
+        let filled = fill(out);
+        let read = RUN_PARTS.with(std::cell::Cell::get)[0] - reads;
+        RUN_PARTS.with(|p| {
+            let mut v = p.get();
+            v[2] += (at.elapsed().as_micros() as u64).saturating_sub(read);
+            p.set(v);
+        });
+        filled
+    };
+    let at = std::time::Instant::now();
     if request.options & PAGE_DESTINATION == 0 {
         // Opens the guarded blocks and tells the GPU side a placed texture
         // there changes. `fill` writes from user mode (a file read is read
         // beside first, see `execute`), so a block guarded again meanwhile
         // faults into the guard instead of failing the write.
         victory_gpu::kernel_will_write(request.destination as usize, len);
+        run_part(2, at);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
         let filled = fill(out).map(drop);
+        let at = std::time::Instant::now();
         // Said again now that the bytes are there (upstream's c75fdba holds
         // the blocks open over the read and marks them once more at its
         // end): a copy or a texture pass that took the memory while the
         // read was under way took what was there before. Counted; acted on
         // only with `VICTORY_PAGE_WRITES=all`.
         victory_gpu::title_memory_written(request.destination as usize, len, false);
+        run_part(4, at);
         return filled;
     }
     let offset = (request.page_offset & 0xffff) as usize;
@@ -1316,7 +1425,9 @@ fn into_destination(
         if before {
             super::xmem::pages_will_write(pages, offset, len);
         }
+        run_part(2, at);
         let filled = fill(window.bytes()).map(drop);
+        let at = std::time::Instant::now();
         drop(window);
         // The title maps pages where the card reads them and has them
         // filled afterwards: the GPU side's copies of those addresses
@@ -1324,13 +1435,18 @@ fn into_destination(
         // #571). After a decode that failed part way too: what it wrote
         // is there.
         super::xmem::pages_written(pages, offset, len);
+        run_part(4, at);
         return filled;
     }
+    run_part(2, at);
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
+    let at = std::time::Instant::now();
     if before {
         super::xmem::pages_will_write(pages, offset, n);
     }
+    // Here the telling before and the write after are one part (4).
+    let _after = Defer(Some(move || run_part(4, at)));
     // A page the title has just made, or a view the host refuses for a
     // moment, comes right a little later: the write is tried again before
     // the request fails (`VICTORY_DSTORAGE_RETRIES`, 12 tries, about 0.9 s
@@ -1386,6 +1502,18 @@ fn into_destination(
             "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
         );
         Err(E_INVALIDARG)
+    }
+}
+
+/// Runs its closure when dropped (a part's time to the function's end,
+/// whichever way it returns).
+struct Defer<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Drop for Defer<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
     }
 }
 
@@ -1691,6 +1819,9 @@ mod tests {
             held_line: None,
             slowest: (0, 0, 0),
             slow: [0; 4],
+            queued: HashMap::new(),
+            slow_parts: Default::default(),
+            slowest_parts: [0; PARTS],
         }
     }
 

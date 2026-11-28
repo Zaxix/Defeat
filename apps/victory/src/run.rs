@@ -26,6 +26,17 @@ pub fn run(
         Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
+    println!("source         {}", env!("VICTORY_SOURCE"));
+    // Every switch of ours set for this run, so a log says what it ran.
+    let mut switches: Vec<String> = std::env::vars()
+        .filter(|(k, _)| k.starts_with("VICTORY_"))
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    switches.sort();
+    println!(
+        "switches       {}",
+        if switches.is_empty() { "none set".to_owned() } else { switches.join(" ") }
+    );
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
